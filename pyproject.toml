@@ -1,9 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
-name = "cloud-matching"
+name = "stochastic-bridge"
 version = "0.1.0"
-requires-python = ">=3.12"
+description = "Conditional stochastic image bridge with Sinkhorn cloud matching"
+requires-python = ">=3.10"
 dependencies = [
-    "geomloss>=0.3.1",
-    "torch>=2.14.0",
-    "torchvision>=0.29.0",
+  "torch>=2.2",
+  "torchvision>=0.17",
+  "geomloss>=0.2.6",
+  "numpy>=1.26",
+  "pillow>=10",
+  "pyyaml>=6",
+  "tensorboard>=2.15",
+  "tqdm>=4.66",
 ]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

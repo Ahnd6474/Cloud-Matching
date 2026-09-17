@@ -1,0 +1,9 @@
+torch>=2.2
+torchvision>=0.17
+geomloss>=0.2.6
+numpy>=1.26
+pillow>=10
+pyyaml>=6
+tensorboard>=2.15
+tqdm>=4.66
+pytest>=8

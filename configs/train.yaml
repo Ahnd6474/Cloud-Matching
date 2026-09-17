@@ -1,0 +1,102 @@
+data:
+  # Set this to a directory containing jpg/png/webp images, or pass --data.
+  root: "data/images"
+  # Training reads this fixed, pre-generated dataset. Set to "" only for the
+  # legacy on-the-fly corruption path.
+  prepared_root: "data/prepared"
+  prepared_cache_shards: 2
+  synthetic: false
+  synthetic_length: 256
+  image_size: 64
+  batch_size: 8
+  workers: 4
+  prefetch_factor: 2
+  random_crop: true
+  horizontal_flip: true
+
+prepare:
+  # Four independently augmented/corrupted records are created per source image.
+  variants_per_image: 4
+  shard_size: 64
+  batch_size: 8
+  workers: 0
+  seed: 17
+
+schedule:
+  steps: 100
+  beta_start: 0.0001
+  beta_end: 0.02
+  answer_jump: 10
+
+corruption:
+  # Weights are relative probabilities; set a type to 0 to disable it.
+  # Set enabled: false for the exact analytic VP-Gaussian posterior path.
+  enabled: true
+  spatial_floor: 0.08
+  student_t_df: 3.0
+  weights:
+    white_gaussian: 40
+    local_gaussian: 12
+    edge_gaussian: 8
+    low_frequency_gaussian: 6
+    high_frequency_gaussian: 6
+    band_pass_gaussian: 4
+    channel_correlated_gaussian: 4
+    low_rank_gaussian: 4
+    anisotropic_gaussian: 4
+    signal_dependent_gaussian: 4
+    student_t: 2
+    laplace: 2
+    poisson: 2
+    speckle: 2
+    impulse: 2
+    blur: 3
+    downsample: 3
+    mask: 3
+
+goal_corruption:
+  enabled: true
+  blur_probability: 0.35
+  downsample_probability: 0.50
+  mask_probability: 0.25
+  minimum_scale: 0.25
+  maximum_mask_fraction: 0.30
+
+model:
+  # Choose: cnn or vit. Both paths share the same weights for current and goal.
+  encoder_type: cnn
+  in_channels: 3
+  base_channels: 32
+  heads: 8
+  attention_depth: 2
+  max_residual: 1.0
+  vit_depth: 4
+  vit_patch_size: 8
+
+loss:
+  # Choose: paired, energy, or sinkhorn.
+  name: energy
+  samples: 4
+  sinkhorn_blur: 0.05
+
+train:
+  epochs: 20
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  amp: true
+  # float16 is fastest on most CUDA GPUs; use bfloat16 on supported hardware
+  # if overflow is a concern.
+  amp_dtype: float16
+  channels_last: true
+  tf32: true
+  fused_optimizer: true
+  # Enable after the eager run is stable; first-step compilation takes time.
+  compile: false
+  compile_mode: reduce-overhead
+  seed: 17
+  log_every: 20
+  preview_every: 200
+  save_every: 1000
+  output_dir: "runs/default"
+  resume: ""
