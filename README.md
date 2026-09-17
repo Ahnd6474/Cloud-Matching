@@ -211,6 +211,11 @@ includes checkpoints, training curves, corruption/severity comparisons, cloud
 distribution plots, uncertainty maps, and a 40-step fixed-goal rollout with
 per-step image and hidden-feature similarity metrics.
 
+The full experiment prepares 16 transitions per DIV2K training image (12,800
+fixed records) and trains for 60 epochs, or roughly 24,000 optimizer updates at
+global batch size 32. It uses versioned output and cache directories so the old
+20-epoch cosine-scheduler checkpoint is not resumed accidentally.
+
 The standalone launcher and full-size experiment settings are:
 
 - `kaggle/train_div2k_ddp.py`

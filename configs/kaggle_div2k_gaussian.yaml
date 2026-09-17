@@ -13,7 +13,8 @@ data:
   horizontal_flip: true
 
 prepare:
-  variants_per_image: 4
+  # 800 DIV2K images x 16 = 12,800 fixed image/transition records.
+  variants_per_image: 16
   shard_size: 64
   batch_size: 8
   workers: 2
@@ -60,7 +61,8 @@ loss:
   sinkhorn_blur: 0.05
 
 train:
-  epochs: 20
+  # T4 x2, global batch 32: about 400 updates/epoch, 24k updates total.
+  epochs: 60
   learning_rate: 0.0003
   weight_decay: 0.0001
   grad_clip: 1.0
@@ -75,5 +77,5 @@ train:
   log_every: 20
   preview_every: 200
   save_every: 1000
-  output_dir: "/kaggle/working/cloud_matching_div2k"
+  output_dir: "/kaggle/working/cloud_matching_div2k_60e_v16"
   resume: ""
