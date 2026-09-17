@@ -1,0 +1,76 @@
+data:
+  root: ""
+  prepared_root: ""
+  prepared_cache_shards: 4
+  synthetic: false
+  synthetic_length: 32
+  image_size: 64
+  # Per-GPU batch size. T4 x2 gives a global batch size of 32.
+  batch_size: 16
+  workers: 2
+  prefetch_factor: 2
+  random_crop: true
+  horizontal_flip: true
+
+prepare:
+  variants_per_image: 4
+  shard_size: 64
+  batch_size: 8
+  workers: 2
+  seed: 17
+
+schedule:
+  steps: 100
+  beta_start: 0.0001
+  beta_end: 0.02
+  answer_jump: 10
+
+# Exact VP Gaussian path: no mixed corruption and no extra goal degradation.
+corruption:
+  enabled: false
+  spatial_floor: 0.08
+  student_t_df: 3.0
+  weights:
+    white_gaussian: 1
+
+goal_corruption:
+  enabled: false
+  blur_probability: 0.0
+  downsample_probability: 0.0
+  mask_probability: 0.0
+  minimum_scale: 0.25
+  maximum_mask_fraction: 0.30
+
+model:
+  encoder_type: cnn
+  in_channels: 3
+  base_channels: 32
+  heads: 8
+  attention_depth: 2
+  max_residual: 1.0
+  vit_depth: 4
+  vit_patch_size: 8
+
+loss:
+  name: paired
+  samples: 4
+  sinkhorn_blur: 0.05
+
+train:
+  epochs: 20
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  amp: true
+  amp_dtype: float16
+  channels_last: true
+  tf32: true
+  fused_optimizer: true
+  compile: false
+  compile_mode: reduce-overhead
+  seed: 17
+  log_every: 20
+  preview_every: 200
+  save_every: 1000
+  output_dir: "/kaggle/working/cloud_matching_div2k"
+  resume: ""

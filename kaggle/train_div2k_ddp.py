@@ -1,0 +1,414 @@
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import random
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+import torch.distributed as dist
+from torch import Tensor, nn
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, DistributedSampler
+from tqdm.auto import tqdm
+
+from stochastic_bridge.config import load_config
+from stochastic_bridge.losses import build_cloud_loss
+from stochastic_bridge.model import StochasticImageBridge
+from stochastic_bridge.prepared import PreparedBridgeDataset
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="DIV2K Gaussian-only DDP training")
+    parser.add_argument("--config", default="configs/kaggle_div2k_gaussian.yaml")
+    parser.add_argument("--train-prepared", required=True)
+    parser.add_argument("--val-prepared", required=True)
+    parser.add_argument("--output", default="/kaggle/working/cloud_matching_div2k")
+    parser.add_argument("--epochs", type=int)
+    parser.add_argument("--resume", default="")
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    parser.add_argument("--max-train-batches", type=int, default=0)
+    parser.add_argument("--max-val-batches", type=int, default=0)
+    return parser.parse_args()
+
+
+def distributed_setup(requested_device: str) -> tuple[int, int, int, torch.device]:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    use_cuda = torch.cuda.is_available() and requested_device != "cpu"
+    if requested_device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but is unavailable")
+    if world_size > 1:
+        backend = "nccl" if use_cuda else "gloo"
+        if use_cuda:
+            torch.cuda.set_device(local_rank)
+        # torchrun/Kaggle uses env://.  A file store is also accepted so the
+        # same trainer can be smoke-tested on Windows builds without libuv.
+        init_method = os.environ.get("CLOUD_MATCHING_DIST_INIT_METHOD", "env://")
+        init_kwargs: dict[str, Any] = {}
+        if init_method != "env://":
+            init_kwargs.update(rank=rank, world_size=world_size)
+        dist.init_process_group(
+            backend=backend,
+            init_method=init_method,
+            **init_kwargs,
+        )
+    device = torch.device(f"cuda:{local_rank}" if use_cuda else "cpu")
+    return rank, local_rank, world_size, device
+
+
+def seed_everything(seed: int, rank: int) -> None:
+    seed = seed + rank
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def reduce_totals(values: Tensor, world_size: int) -> Tensor:
+    if world_size > 1:
+        dist.all_reduce(values, op=dist.ReduceOp.SUM)
+    return values
+
+
+def psnr(predicted: Tensor, target: Tensor) -> Tensor:
+    mse = (predicted - target).square().flatten(1).mean(1).clamp_min(1e-10)
+    return 10.0 * torch.log10(4.0 / mse)
+
+
+def move_batch(
+    raw: dict[str, Tensor], device: torch.device, channels_last: bool
+) -> dict[str, Tensor]:
+    moved: dict[str, Tensor] = {}
+    for key in (
+        "clean",
+        "current",
+        "goal",
+        "target_cloud",
+        "target_noise",
+        "current_level",
+        "goal_level",
+        "answer_level",
+    ):
+        value = raw[key].to(device, non_blocking=True)
+        if channels_last and key in {"clean", "current", "goal"}:
+            value = value.contiguous(memory_format=torch.channels_last)
+        moved[key] = value
+    return moved
+
+
+@torch.no_grad()
+def validate(
+    model: nn.Module,
+    loader: DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+    samples: int,
+    channels_last: bool,
+    amp_enabled: bool,
+    max_batches: int,
+) -> dict[str, float]:
+    model.eval()
+    totals = torch.zeros(4, device=device)
+    for batch_index, raw in enumerate(loader):
+        if max_batches and batch_index >= max_batches:
+            break
+        batch = move_batch(raw, device, channels_last)
+        with torch.autocast(
+            device_type=device.type,
+            dtype=torch.float16,
+            enabled=amp_enabled,
+        ):
+            predicted = model(
+                batch["current"],
+                batch["goal"],
+                samples=samples,
+                noise=batch["target_noise"],
+            )
+            loss = criterion(predicted, batch["target_cloud"], batch["current"])
+        count = batch["clean"].shape[0]
+        output_mean = predicted.float().mean(1)
+        totals += torch.tensor(
+            [
+                loss.float().item() * count,
+                psnr(batch["current"].float(), batch["clean"].float()).sum().item(),
+                psnr(output_mean, batch["clean"].float()).sum().item(),
+                count,
+            ],
+            device=device,
+        )
+    model.train()
+    denominator = max(totals[3].item(), 1.0)
+    return {
+        "val_loss": totals[0].item() / denominator,
+        "val_current_psnr": totals[1].item() / denominator,
+        "val_output_psnr": totals[2].item() / denominator,
+    }
+
+
+def save_checkpoint(
+    path: Path,
+    model: StochasticImageBridge,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    scaler: torch.amp.GradScaler,
+    epoch: int,
+    history: list[dict[str, float]],
+    config: dict[str, Any],
+) -> None:
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "scaler": scaler.state_dict(),
+            "epoch": epoch,
+            "history": history,
+            "config": config,
+        },
+        path,
+    )
+
+
+def main() -> None:
+    args = parse_args()
+    rank, local_rank, world_size, device = distributed_setup(args.device)
+    is_main = rank == 0
+    config = load_config(args.config)
+    if args.epochs is not None:
+        config.train.epochs = args.epochs
+    seed_everything(config.train.seed, rank)
+
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = config.train.tf32
+        torch.backends.cudnn.allow_tf32 = config.train.tf32
+    torch.set_float32_matmul_precision("high")
+
+    output = Path(args.output).resolve()
+    if is_main:
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "config.json").write_text(
+            json.dumps(config.to_dict(), indent=2), encoding="utf-8"
+        )
+    if world_size > 1:
+        dist.barrier()
+
+    train_dataset = PreparedBridgeDataset(
+        args.train_prepared, cache_shards=config.data.prepared_cache_shards
+    )
+    val_dataset = PreparedBridgeDataset(
+        args.val_prepared, cache_shards=config.data.prepared_cache_shards
+    )
+    for dataset in (train_dataset, val_dataset):
+        if not dataset.has_target_noise:
+            raise RuntimeError("Gaussian paired training requires stored target_noise")
+        if int(dataset.manifest["target_samples"]) != config.loss.samples:
+            raise RuntimeError("prepared target_samples does not match config")
+
+    train_sampler = DistributedSampler(
+        train_dataset,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=True,
+        seed=config.train.seed,
+        drop_last=True,
+    )
+    loader_kwargs: dict[str, Any] = {
+        "batch_size": config.data.batch_size,
+        "num_workers": config.data.workers,
+        "pin_memory": device.type == "cuda",
+        "persistent_workers": config.data.workers > 0,
+    }
+    if config.data.workers > 0:
+        loader_kwargs["prefetch_factor"] = config.data.prefetch_factor
+    train_loader = DataLoader(
+        train_dataset,
+        sampler=train_sampler,
+        drop_last=True,
+        **loader_kwargs,
+    )
+    val_loader = (
+        DataLoader(val_dataset, shuffle=False, drop_last=False, **loader_kwargs)
+        if is_main
+        else None
+    )
+
+    model = StochasticImageBridge(**config.model.__dict__).to(device)
+    channels_last = config.train.channels_last and config.model.encoder_type == "cnn"
+    if channels_last:
+        model.to(memory_format=torch.channels_last)
+    train_model: nn.Module = model
+    if world_size > 1:
+        ddp_device = (
+            {"device_ids": [local_rank], "output_device": local_rank}
+            if device.type == "cuda"
+            else {}
+        )
+        train_model = DDP(
+            model,
+            broadcast_buffers=False,
+            gradient_as_bucket_view=True,
+            static_graph=True,
+            **ddp_device,
+        )
+    criterion = build_cloud_loss(
+        config.loss.name, blur=config.loss.sinkhorn_blur
+    ).to(device)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config.train.learning_rate,
+        weight_decay=config.train.weight_decay,
+        fused=config.train.fused_optimizer and device.type == "cuda",
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(config.train.epochs, 1)
+    )
+    amp_enabled = config.train.amp and device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
+    history: list[dict[str, float]] = []
+    start_epoch = 0
+    best_val = math.inf
+    resume = args.resume or config.train.resume
+    if resume:
+        state = torch.load(resume, map_location=device, weights_only=False)
+        model.load_state_dict(state["model"])
+        optimizer.load_state_dict(state["optimizer"])
+        scheduler.load_state_dict(state["scheduler"])
+        scaler.load_state_dict(state.get("scaler", {}))
+        history = state.get("history", [])
+        start_epoch = int(state.get("epoch", 0))
+        best_val = min((row["val_loss"] for row in history), default=math.inf)
+
+    for epoch in range(start_epoch, config.train.epochs):
+        train_sampler.set_epoch(epoch)
+        train_model.train()
+        totals = torch.zeros(4, device=device)
+        progress = tqdm(
+            train_loader,
+            desc=f"epoch {epoch + 1}/{config.train.epochs}",
+            disable=not is_main,
+        )
+        for batch_index, raw in enumerate(progress):
+            if args.max_train_batches and batch_index >= args.max_train_batches:
+                break
+            optimizer.zero_grad(set_to_none=True)
+            batch = move_batch(raw, device, channels_last)
+            with torch.autocast(
+                device_type=device.type,
+                dtype=torch.float16,
+                enabled=amp_enabled,
+            ):
+                predicted = train_model(
+                    batch["current"],
+                    batch["goal"],
+                    samples=config.loss.samples,
+                    noise=batch["target_noise"],
+                )
+                loss = criterion(
+                    predicted, batch["target_cloud"], batch["current"]
+                )
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), config.train.grad_clip
+            )
+            scaler.step(optimizer)
+            scaler.update()
+
+            count = batch["clean"].shape[0]
+            totals += torch.stack(
+                [
+                    loss.detach().float() * count,
+                    psnr(
+                        predicted.detach().float().mean(1), batch["clean"].float()
+                    ).sum(),
+                    grad_norm.detach().float(),
+                    torch.tensor(float(count), device=device),
+                ]
+            )
+            if is_main and (batch_index + 1) % config.train.log_every == 0:
+                progress.set_postfix(loss=f"{loss.item():.4f}")
+
+        totals = reduce_totals(totals, world_size)
+        count = max(totals[3].item(), 1.0)
+        metrics = {
+            "epoch": float(epoch + 1),
+            "train_loss": totals[0].item() / count,
+            "train_output_psnr": totals[1].item() / count,
+            "gradient_norm": totals[2].item() / max(len(train_loader) * world_size, 1),
+            "learning_rate": optimizer.param_groups[0]["lr"],
+        }
+        # Advance before checkpointing so a resumed run uses the exact next-
+        # epoch learning rate rather than repeating the previous scheduler step.
+        scheduler.step()
+
+        if world_size > 1:
+            dist.barrier()
+        if is_main:
+            assert val_loader is not None
+            metrics.update(
+                validate(
+                    model,
+                    val_loader,
+                    criterion,
+                    device,
+                    config.loss.samples,
+                    channels_last,
+                    amp_enabled,
+                    args.max_val_batches,
+                )
+            )
+            history.append(metrics)
+            (output / "history.json").write_text(
+                json.dumps(history, indent=2), encoding="utf-8"
+            )
+            save_checkpoint(
+                output / "latest.pt",
+                model,
+                optimizer,
+                scheduler,
+                scaler,
+                epoch + 1,
+                history,
+                config.to_dict(),
+            )
+            if metrics["val_loss"] < best_val:
+                best_val = metrics["val_loss"]
+                save_checkpoint(
+                    output / "best.pt",
+                    model,
+                    optimizer,
+                    scheduler,
+                    scaler,
+                    epoch + 1,
+                    history,
+                    config.to_dict(),
+                )
+            print(json.dumps(metrics, indent=2))
+        if world_size > 1:
+            dist.barrier()
+
+    if is_main:
+        save_checkpoint(
+            output / "final.pt",
+            model,
+            optimizer,
+            scheduler,
+            scaler,
+            config.train.epochs,
+            history,
+            config.to_dict(),
+        )
+    if world_size > 1:
+        dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()

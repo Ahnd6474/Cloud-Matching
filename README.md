@@ -198,6 +198,25 @@ TensorBoard:
 .\.venv\Scripts\tensorboard.exe --logdir runs
 ```
 
+## Kaggle DIV2K Gaussian-only experiment
+
+Open [`notebooks/div2k_gaussian_only_kaggle.ipynb`](notebooks/div2k_gaussian_only_kaggle.ipynb)
+in Kaggle, select the **T4 x2** accelerator, enable Internet, and run all cells.
+The notebook downloads DIV2K with `kagglehub`, prepares a fixed Gaussian-only
+dataset, and launches `torchrun` with one process per visible GPU. Its output
+includes checkpoints, training curves, corruption/severity comparisons, cloud
+distribution plots, uncertainty maps, and a 40-step fixed-goal rollout with
+per-step image and hidden-feature similarity metrics.
+
+The standalone launcher and full-size experiment settings are:
+
+- `kaggle/train_div2k_ddp.py`
+- `configs/kaggle_div2k_gaussian.yaml`
+
+Because the notebook clones this repository, commit and push these files before
+starting a Kaggle run (or attach an updated repository snapshot as a Kaggle
+dataset).
+
 ## Sample from a checkpoint
 
 ```powershell
