@@ -42,6 +42,9 @@ used for Sinkhorn divergence.
 
 - One shared encoder for current and goal images, selectable as `cnn` or `vit`.
 - Every bottleneck token participates in current-to-goal cross-attention.
+- A pooled cross-attention head predicts one conditional scalar noise variance
+  `lambda` per image. It is trained only through the cloud loss, without a
+  variance label, and scales standard Gaussian noise by `sqrt(lambda)`.
 - Full-resolution spatial Gaussian noise, rather than only one global vector.
 - U-Net decoder with current-image skip connections.
 - Learned spatial residual and spatial update gate.

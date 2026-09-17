@@ -115,7 +115,7 @@ def validate(
     max_batches: int,
 ) -> dict[str, float]:
     model.eval()
-    totals = torch.zeros(4, device=device)
+    totals = torch.zeros(5, device=device)
     for batch_index, raw in enumerate(loader):
         if max_batches and batch_index >= max_batches:
             break
@@ -125,12 +125,16 @@ def validate(
             dtype=torch.float16,
             enabled=amp_enabled,
         ):
-            predicted = model(
+            model_output = model(
                 batch["current"],
                 batch["goal"],
                 samples=samples,
                 noise=batch["target_noise"],
+                return_noise_variance=True,
             )
+            if not isinstance(model_output, tuple):
+                raise RuntimeError("model did not return its noise variance")
+            predicted, noise_variance = model_output
             loss = criterion(predicted, batch["target_cloud"], batch["current"])
         count = batch["clean"].shape[0]
         output_mean = predicted.float().mean(1)
@@ -139,16 +143,18 @@ def validate(
                 loss.float().item() * count,
                 psnr(batch["current"].float(), batch["clean"].float()).sum().item(),
                 psnr(output_mean, batch["clean"].float()).sum().item(),
+                noise_variance.float().sum().item(),
                 count,
             ],
             device=device,
         )
     model.train()
-    denominator = max(totals[3].item(), 1.0)
+    denominator = max(totals[4].item(), 1.0)
     return {
         "val_loss": totals[0].item() / denominator,
         "val_current_psnr": totals[1].item() / denominator,
         "val_output_psnr": totals[2].item() / denominator,
+        "val_noise_variance": totals[3].item() / denominator,
     }
 
 
@@ -289,7 +295,7 @@ def main() -> None:
     for epoch in range(start_epoch, config.train.epochs):
         train_sampler.set_epoch(epoch)
         train_model.train()
-        totals = torch.zeros(4, device=device)
+        totals = torch.zeros(5, device=device)
         progress = tqdm(
             train_loader,
             desc=f"epoch {epoch + 1}/{config.train.epochs}",
@@ -305,12 +311,16 @@ def main() -> None:
                 dtype=torch.float16,
                 enabled=amp_enabled,
             ):
-                predicted = train_model(
+                model_output = train_model(
                     batch["current"],
                     batch["goal"],
                     samples=config.loss.samples,
                     noise=batch["target_noise"],
+                    return_noise_variance=True,
                 )
+                if not isinstance(model_output, tuple):
+                    raise RuntimeError("model did not return its noise variance")
+                predicted, noise_variance = model_output
                 loss = criterion(
                     predicted, batch["target_cloud"], batch["current"]
                 )
@@ -330,6 +340,7 @@ def main() -> None:
                         predicted.detach().float().mean(1), batch["clean"].float()
                     ).sum(),
                     grad_norm.detach().float(),
+                    noise_variance.detach().float().sum(),
                     torch.tensor(float(count), device=device),
                 ]
             )
@@ -337,12 +348,13 @@ def main() -> None:
                 progress.set_postfix(loss=f"{loss.item():.4f}")
 
         totals = reduce_totals(totals, world_size)
-        count = max(totals[3].item(), 1.0)
+        count = max(totals[4].item(), 1.0)
         metrics = {
             "epoch": float(epoch + 1),
             "train_loss": totals[0].item() / count,
             "train_output_psnr": totals[1].item() / count,
             "gradient_norm": totals[2].item() / max(len(train_loader) * world_size, 1),
+            "train_noise_variance": totals[3].item() / count,
             "learning_rate": optimizer.param_groups[0]["lr"],
         }
         # Advance before checkpointing so a resumed run uses the exact next-

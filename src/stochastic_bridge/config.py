@@ -87,6 +87,9 @@ class ModelConfig:
     heads: int = 8
     attention_depth: int = 2
     max_residual: float = 1.0
+    noise_variance_min: float = 1e-4
+    noise_variance_max: float = 1.0
+    noise_variance_init: float = 0.1
     encoder_type: str = "cnn"
     vit_depth: int = 4
     vit_patch_size: int = 8

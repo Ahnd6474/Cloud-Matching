@@ -81,6 +81,46 @@ def test_model_and_sinkhorn_backward() -> None:
     assert gradient_sum > 0.0
 
 
+def test_cross_attention_condition_predicts_trainable_scalar_noise_variance() -> None:
+    torch.manual_seed(13)
+    model = StochasticImageBridge(
+        in_channels=3,
+        base_channels=8,
+        heads=4,
+        attention_depth=1,
+        noise_variance_min=1e-4,
+        noise_variance_max=1.0,
+        noise_variance_init=0.1,
+    )
+    current = torch.randn(2, 3, 16, 16).clamp(-1.0, 1.0)
+    goal = torch.randn(2, 3, 16, 16).clamp(-1.0, 1.0)
+    noise = torch.randn(2, 3, 3, 16, 16)
+
+    output = model(
+        current,
+        goal,
+        samples=3,
+        noise=noise,
+        return_noise_variance=True,
+    )
+    assert isinstance(output, tuple)
+    cloud, noise_variance = output
+    assert cloud.shape == (2, 3, 3, 16, 16)
+    assert noise_variance.shape == (2,)
+    torch.testing.assert_close(noise_variance, torch.full_like(noise_variance, 0.1))
+
+    # There is no direct lambda label: an ordinary cloud objective must be able
+    # to update the variance head through the reparameterized noise path.
+    target = torch.randn_like(cloud).clamp(-1.0, 1.0)
+    torch.nn.functional.mse_loss(cloud, target).backward()
+    variance_gradient = sum(
+        parameter.grad.abs().sum().item()
+        for parameter in model.noise_variance_head.parameters()
+        if parameter.grad is not None
+    )
+    assert variance_gradient > 0.0
+
+
 def test_training_batch_contains_reparameterization_noise() -> None:
     torch.manual_seed(19)
     schedule = VPNoiseSchedule(steps=100)

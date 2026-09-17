@@ -121,12 +121,16 @@ class Trainer:
                 dtype=self.amp_dtype,
                 enabled=self.amp_enabled,
             ):
-                predicted = self.forward_model(
+                model_output = self.forward_model(
                     bridge.current,
                     bridge.goal,
                     samples=self.config.loss.samples,
                     noise=model_noise,
+                    return_noise_variance=True,
                 )
+                if not isinstance(model_output, tuple):
+                    raise RuntimeError("model did not return its noise variance")
+                predicted, noise_variance = model_output
                 loss = self.criterion(predicted, bridge.target_cloud, bridge.current)
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
@@ -149,6 +153,9 @@ class Trainer:
                 )
                 self.writer.add_scalar(
                     "train/goal_level", bridge.goal_level.float().mean(), self.global_step
+                )
+                self.writer.add_scalar(
+                    "train/noise_variance", noise_variance.detach().float().mean(), self.global_step
                 )
             if self.global_step % self.config.train.preview_every == 0:
                 self._save_preview(bridge, predicted)

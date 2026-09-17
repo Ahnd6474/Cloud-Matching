@@ -200,6 +200,9 @@ class StochasticImageBridge(nn.Module):
         heads: int = 8,
         attention_depth: int = 2,
         max_residual: float = 1.0,
+        noise_variance_min: float = 1e-4,
+        noise_variance_max: float = 1.0,
+        noise_variance_init: float = 0.1,
         encoder_type: str = "cnn",
         vit_depth: int = 4,
         vit_patch_size: int = 8,
@@ -220,10 +223,16 @@ class StochasticImageBridge(nn.Module):
             raise ValueError("base_channels * 8 must be divisible by heads")
         if bottleneck_channels % 4:
             raise ValueError("base_channels * 8 must be divisible by 4")
+        if not 0.0 <= noise_variance_min < noise_variance_max:
+            raise ValueError("noise_variance_min must be non-negative and below max")
+        if not noise_variance_min < noise_variance_init < noise_variance_max:
+            raise ValueError("noise_variance_init must lie strictly between min and max")
 
         self.in_channels = in_channels
         self.base_channels = base_channels
         self.max_residual = max_residual
+        self.noise_variance_min = noise_variance_min
+        self.noise_variance_max = noise_variance_max
         normalized_encoder = encoder_type.strip().lower()
         if normalized_encoder == "cnn":
             self.encoder: nn.Module = SharedPyramidEncoder(in_channels, base_channels)
@@ -241,6 +250,21 @@ class StochasticImageBridge(nn.Module):
         self.attention = nn.ModuleList(
             [CrossAttentionBlock(bottleneck_channels, heads) for _ in range(attention_depth)]
         )
+        variance_hidden = max(bottleneck_channels // 4, 8)
+        self.noise_variance_head = nn.Sequential(
+            nn.LayerNorm(bottleneck_channels),
+            nn.Linear(bottleneck_channels, variance_hidden),
+            nn.SiLU(),
+            nn.Linear(variance_hidden, 1),
+        )
+        variance_fraction = (noise_variance_init - noise_variance_min) / (
+            noise_variance_max - noise_variance_min
+        )
+        variance_bias = math.log(variance_fraction / (1.0 - variance_fraction))
+        final_variance_layer = self.noise_variance_head[-1]
+        assert isinstance(final_variance_layer, nn.Linear)
+        nn.init.zeros_(final_variance_layer.weight)
+        nn.init.constant_(final_variance_layer.bias, variance_bias)
         self.noise_projection = nn.Sequential(
             nn.Conv2d(in_channels, bottleneck_channels, 3, padding=1),
             nn.SiLU(),
@@ -291,14 +315,31 @@ class StochasticImageBridge(nn.Module):
         fused = current_tokens.transpose(1, 2).reshape_as(current_bottleneck)
         return fused, current_features[:-1]
 
+    def noise_variance_from_condition(self, fused: Tensor) -> Tensor:
+        """Predict one conditional latent variance per input image."""
+        if fused.ndim != 4:
+            raise ValueError("fused condition must have shape [B,C,H,W]")
+        pooled = fused.mean(dim=(-2, -1))
+        unit_variance = torch.sigmoid(self.noise_variance_head(pooled))
+        return self.noise_variance_min + (
+            self.noise_variance_max - self.noise_variance_min
+        ) * unit_variance
+
+    def predict_noise_variance(self, current: Tensor, goal: Tensor) -> Tensor:
+        """Encode a condition and return its learned scalar latent variance [B]."""
+        fused, _ = self.encode_condition(current, goal)
+        return self.noise_variance_from_condition(fused).squeeze(-1)
+
     def forward(
         self,
         current: Tensor,
         goal: Tensor,
         samples: int = 4,
         noise: Tensor | None = None,
-    ) -> Tensor:
+        return_noise_variance: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor]:
         fused, current_skips = self.encode_condition(current, goal)
+        noise_variance = self.noise_variance_from_condition(fused)
         batch, _, height, width = current.shape
         if samples < 1:
             raise ValueError("samples must be positive")
@@ -316,7 +357,13 @@ class StochasticImageBridge(nn.Module):
         if noise.shape != expected:
             raise ValueError(f"noise must have shape {expected}, got {tuple(noise.shape)}")
 
-        flat_noise = noise.reshape(batch * samples, self.in_channels, height, width)
+        # lambda is a learned variance, so its square root scales the standard
+        # Gaussian supplied by the caller. Cloud matching is its only target.
+        noise_scale = noise_variance.sqrt().reshape(batch, 1, 1, 1, 1)
+        scaled_noise = noise * noise_scale
+        flat_noise = scaled_noise.reshape(
+            batch * samples, self.in_channels, height, width
+        )
         noise_low = F.interpolate(
             flat_noise, size=fused.shape[-2:], mode="bilinear", align_corners=False
         )
@@ -348,7 +395,10 @@ class StochasticImageBridge(nn.Module):
             .reshape(batch * samples, *current.shape[1:])
         )
         next_state = (flat_current + gate * residual).clamp(-1.0, 1.0)
-        return next_state.reshape(batch, samples, *current.shape[1:])
+        cloud = next_state.reshape(batch, samples, *current.shape[1:])
+        if return_noise_variance:
+            return cloud, noise_variance.squeeze(-1)
+        return cloud
 
     def _validate_images(self, current: Tensor, goal: Tensor) -> None:
         if current.ndim != 4 or current.shape != goal.shape:

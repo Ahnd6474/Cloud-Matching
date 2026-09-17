@@ -70,6 +70,9 @@ model:
   heads: 8
   attention_depth: 2
   max_residual: 1.0
+  noise_variance_min: 0.0001
+  noise_variance_max: 1.0
+  noise_variance_init: 0.1
   vit_depth: 4
   vit_patch_size: 8
 
