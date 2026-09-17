@@ -156,6 +156,26 @@ def test_paired_and_energy_losses_backpropagate() -> None:
     assert torch.isfinite(predicted.grad).all()
 
 
+def test_paired_loss_does_not_average_normalized_features_twice() -> None:
+    current = torch.zeros(1, 3, 16, 16)
+    target = torch.zeros(1, 2, 3, 16, 16)
+    predicted = torch.full_like(target, 0.1)
+    criterion = PairedCorrectionLoss()
+
+    current_features = criterion.features(current)
+    predicted_features = criterion.features(predicted.flatten(0, 1)).reshape(1, 2, -1)
+    target_features = criterion.features(target.flatten(0, 1)).reshape(1, 2, -1)
+    predicted_correction = predicted_features - current_features[:, None]
+    target_correction = target_features - current_features[:, None]
+    old_double_mean = torch.nn.functional.smooth_l1_loss(
+        predicted_correction, target_correction
+    )
+
+    actual = criterion(predicted, target, current)
+    # D_total=(3*4^2 + 3*8^2 + 3*16^2)=1008 and there are three scales.
+    torch.testing.assert_close(actual, old_double_mean * (1008 / 3))
+
+
 @pytest.mark.parametrize("encoder_type", ["cnn", "vit"])
 def test_both_shared_encoder_types(encoder_type: str) -> None:
     model = StochasticImageBridge(

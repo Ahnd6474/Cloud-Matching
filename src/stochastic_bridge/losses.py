@@ -83,7 +83,17 @@ class PairedCorrectionLoss(nn.Module):
         current_features = self.features(current)
         predicted = _cloud_features(self.features, predicted_cloud) - current_features[:, None]
         target = _cloud_features(self.features, target_cloud) - current_features[:, None]
-        return F.smooth_l1_loss(predicted, target)
+        elementwise = F.smooth_l1_loss(predicted, target, reduction="none")
+        if isinstance(self.features, MultiScaleCorrectionFeatures):
+            # Every scale was already divided by sqrt(feature_dimension), so a
+            # sum over feature coordinates is its normalized distance. Average
+            # only over scales, samples, and batch. A second mean over the
+            # concatenated feature axis would shrink the default loss by 336x
+            # for the 4/8/16 feature pyramid.
+            return elementwise.sum(dim=-1).mean() / len(self.features.output_sizes)
+        # Preserve conventional elementwise averaging for custom extractors
+        # whose feature normalization semantics are unknown.
+        return elementwise.mean()
 
 
 class EnergyCorrectionCloudLoss(nn.Module):
