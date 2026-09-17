@@ -30,6 +30,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", default="/kaggle/working/cloud_matching_div2k")
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--resume", default="")
+    parser.add_argument(
+        "--init-checkpoint",
+        default="",
+        help="Load model weights only and start a fresh fine-tuning schedule",
+    )
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--max-train-batches", type=int, default=0)
     parser.add_argument("--max-val-batches", type=int, default=0)
@@ -265,7 +270,12 @@ def main() -> None:
             **ddp_device,
         )
     criterion = build_cloud_loss(
-        config.loss.name, blur=config.loss.sinkhorn_blur
+        config.loss.name,
+        blur=config.loss.sinkhorn_blur,
+        full_band_levels=config.loss.full_band_levels,
+        full_band_charbonnier_epsilon=config.loss.full_band_charbonnier_epsilon,
+        full_band_high_weight=config.loss.full_band_high_weight,
+        full_band_low_weight=config.loss.full_band_low_weight,
     ).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -282,6 +292,13 @@ def main() -> None:
     start_epoch = 0
     best_val = math.inf
     resume = args.resume or config.train.resume
+    if resume and args.init_checkpoint:
+        raise ValueError("--resume and --init-checkpoint are mutually exclusive")
+    if args.init_checkpoint:
+        state = torch.load(args.init_checkpoint, map_location=device, weights_only=False)
+        model.load_state_dict(state["model"])
+        if is_main:
+            print(f"initialized model weights from {args.init_checkpoint}")
     if resume:
         state = torch.load(resume, map_location=device, weights_only=False)
         model.load_state_dict(state["model"])

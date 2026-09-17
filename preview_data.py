@@ -60,6 +60,7 @@ def main() -> None:
             config.data.root,
             config.data.image_size,
             random_crop=config.data.random_crop,
+            crop_mode=config.data.crop_mode,
             horizontal_flip=config.data.horizontal_flip,
         )
     )

@@ -5,6 +5,7 @@ import pytest
 
 from stochastic_bridge import (
     EnergyCorrectionCloudLoss,
+    PairedFullBandCloudLoss,
     PairedCorrectionLoss,
     SinkhornCorrectionCloudLoss,
     StochasticImageBridge,
@@ -176,6 +177,39 @@ def test_paired_loss_does_not_average_normalized_features_twice() -> None:
     torch.testing.assert_close(actual, old_double_mean * (1008 / 3))
 
 
+def test_full_band_paired_loss_detects_checkerboard_null_space() -> None:
+    current = torch.zeros(1, 3, 64, 64)
+    target = torch.zeros(1, 2, 3, 64, 64)
+    yy, xx = torch.meshgrid(torch.arange(64), torch.arange(64), indexing="ij")
+    checkerboard = ((xx + yy).remainder(2) * 2 - 1).float() * 0.1
+    predicted = checkerboard[None, None, None].expand_as(target).clone()
+
+    pooled = PairedCorrectionLoss()(predicted, target, current)
+    full_band = PairedFullBandCloudLoss(levels=3)(predicted, target, current)
+
+    # Every 4x4-or-larger average is zero, but the full-resolution high band
+    # must retain and penalize the alternating phase pattern.
+    assert pooled.abs().item() < 1e-8
+    assert full_band.item() > 1e-2
+
+
+def test_full_band_paired_loss_is_zero_for_identical_cloud_and_backpropagates() -> None:
+    torch.manual_seed(29)
+    current = torch.randn(2, 3, 16, 16)
+    target = torch.randn(2, 3, 3, 16, 16).clamp(-1.0, 1.0)
+    predicted = (target.detach().clone() + 0.05).requires_grad_(True)
+    criterion = PairedFullBandCloudLoss(levels=2)
+
+    identical = criterion(target, target, current)
+    shifted = criterion(predicted, target, current)
+    shifted.backward()
+
+    torch.testing.assert_close(identical, torch.zeros_like(identical))
+    assert shifted.item() > 0.0
+    assert predicted.grad is not None
+    assert torch.isfinite(predicted.grad).all()
+
+
 @pytest.mark.parametrize("encoder_type", ["cnn", "vit"])
 def test_both_shared_encoder_types(encoder_type: str) -> None:
     model = StochasticImageBridge(
@@ -191,3 +225,52 @@ def test_both_shared_encoder_types(encoder_type: str) -> None:
     output = model(current, goal, samples=2)
     assert output.shape == (1, 2, 3, 32, 32)
     assert model.encoder_type == encoder_type
+
+
+@pytest.mark.parametrize("encoder_type", ["cnn", "vit"])
+def test_implicit_coordinate_decoder_supports_both_encoders(encoder_type: str) -> None:
+    torch.manual_seed(31)
+    model = StochasticImageBridge(
+        in_channels=3,
+        base_channels=8,
+        heads=4,
+        attention_depth=1,
+        encoder_type=encoder_type,
+        vit_depth=1,
+        decoder_type="implicit",
+        implicit_hidden_dim=32,
+        implicit_depth=2,
+        implicit_fourier_bands=3,
+        implicit_chunk_size=257,
+    )
+    current = torch.randn(2, 3, 16, 16).clamp(-1.0, 1.0)
+    goal = torch.randn(2, 3, 16, 16).clamp(-1.0, 1.0)
+    noise = torch.randn(2, 2, 3, 16, 16)
+
+    output, variance = model(
+        current,
+        goal,
+        samples=2,
+        noise=noise,
+        return_noise_variance=True,
+    )
+    loss = PairedFullBandCloudLoss(levels=2)(
+        output, torch.zeros_like(output), current
+    )
+    loss.backward()
+
+    assert output.shape == (2, 2, 3, 16, 16)
+    assert variance.shape == (2,)
+    assert model.decoder_type == "implicit"
+    assert not any(
+        isinstance(module, (torch.nn.Conv2d, torch.nn.ConvTranspose2d))
+        for module in model.implicit_decoder.modules()
+    )
+    assert any(
+        parameter.grad is not None and parameter.grad.abs().sum().item() > 0.0
+        for parameter in model.implicit_decoder.parameters()
+    )
+    assert any(
+        parameter.grad is not None and parameter.grad.abs().sum().item() > 0.0
+        for parameter in model.noise_variance_head.parameters()
+    )

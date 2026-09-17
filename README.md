@@ -46,7 +46,9 @@ used for Sinkhorn divergence.
   `lambda` per image. It is trained only through the cloud loss, without a
   variance label, and scales standard Gaussian noise by `sqrt(lambda)`.
 - Full-resolution spatial Gaussian noise, rather than only one global vector.
-- U-Net decoder with current-image skip connections.
+- Selectable decoder: the legacy convolutional U-Net or a coordinate implicit
+  MLP that samples fused features continuously and contains no learned
+  upsampling/transposed convolution.
 - Learned spatial residual and spatial update gate.
 - Condition encoding is computed once and reused for every cloud sample.
 
@@ -56,6 +58,9 @@ Change `loss.name` in `configs/train.yaml`:
 
 - `paired`: same posterior noise is used by model and target; available only
   when `corruption.enabled: false` selects the analytic VP Gaussian path.
+- `paired_full_band`: the same analytic noise pairing, evaluated over a
+  complete stride-free a-trous frequency pyramid. Unlike pooled features, it
+  retains full-resolution checkerboard, edge, and texture errors.
 - `energy`: unpaired energy distance; current default.
 - `sinkhorn`: debiased Sinkhorn divergence from GeomLoss.
 
@@ -67,8 +72,11 @@ Select the shared encoder in the same config:
 ```yaml
 model:
   encoder_type: vit  # cnn or vit
+  decoder_type: implicit  # conv or implicit
   vit_depth: 4
   vit_patch_size: 8
+  implicit_hidden_dim: 128
+  implicit_depth: 3
 ```
 
 The ViT path creates tokens directly with an 8x8 patch embedding, applies

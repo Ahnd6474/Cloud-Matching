@@ -10,6 +10,7 @@ data:
   workers: 2
   prefetch_factor: 2
   random_crop: true
+  crop_mode: native
   horizontal_flip: true
 
 prepare:
@@ -44,6 +45,8 @@ goal_corruption:
 
 model:
   encoder_type: cnn
+  # LIIF-style coordinate MLP: no transposed convolution or learned upsampling.
+  decoder_type: implicit
   in_channels: 3
   base_channels: 32
   heads: 8
@@ -54,11 +57,20 @@ model:
   noise_variance_init: 0.1
   vit_depth: 4
   vit_patch_size: 8
+  implicit_hidden_dim: 128
+  implicit_depth: 3
+  implicit_fourier_bands: 6
+  implicit_chunk_size: 65536
 
 loss:
-  name: paired
+  # Exact epsilon pairing over a complete undecimated frequency pyramid.
+  name: paired_full_band
   samples: 4
   sinkhorn_blur: 0.05
+  full_band_levels: 3
+  full_band_charbonnier_epsilon: 0.001
+  full_band_high_weight: 1.0
+  full_band_low_weight: 1.0
 
 train:
   # T4 x2, global batch 32: about 400 updates/epoch, 24k updates total.
@@ -77,5 +89,5 @@ train:
   log_every: 20
   preview_every: 200
   save_every: 1000
-  output_dir: "/kaggle/working/cloud_matching_div2k_60e_v16"
+  output_dir: "/kaggle/working/cloud_matching_div2k_implicit_full_band"
   resume: ""

@@ -18,7 +18,7 @@ from .config import ExperimentConfig
 from .corruptions import GoalDetailCorruptor
 from .data import BridgeBatch, build_bridge_batch
 from .datasets import ImageDirectoryDataset, SyntheticImageDataset
-from .losses import build_cloud_loss
+from .losses import build_cloud_loss, is_paired_cloud_loss
 from .model import StochasticImageBridge
 from .noise import CorruptionMixture
 from .prepared import PreparedBridgeDataset, ShardBatchSampler
@@ -65,7 +65,12 @@ class Trainer:
             self.model.to(memory_format=torch.channels_last)
         self.forward_model = self._compile_model(self.model)
         self.criterion = build_cloud_loss(
-            config.loss.name, blur=config.loss.sinkhorn_blur
+            config.loss.name,
+            blur=config.loss.sinkhorn_blur,
+            full_band_levels=config.loss.full_band_levels,
+            full_band_charbonnier_epsilon=config.loss.full_band_charbonnier_epsilon,
+            full_band_high_weight=config.loss.full_band_high_weight,
+            full_band_low_weight=config.loss.full_band_low_weight,
         ).to(self.device)
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
@@ -114,7 +119,7 @@ class Trainer:
                     goal_corruptor=self.goal_corruptor,
                     corruption_mixture=self.corruption_mixture,
                 )
-            paired = self.config.loss.name.lower() == "paired"
+            paired = is_paired_cloud_loss(self.config.loss.name)
             model_noise = bridge.target_noise if paired else None
             with torch.autocast(
                 device_type=self.device.type,
@@ -188,6 +193,7 @@ class Trainer:
                     data.root,
                     data.image_size,
                     random_crop=data.random_crop,
+                    crop_mode=data.crop_mode,
                     horizontal_flip=data.horizontal_flip,
                 )
             )
@@ -217,7 +223,7 @@ class Trainer:
         )
 
     def _validate_loss_data_compatibility(self) -> None:
-        if self.config.loss.name.lower() != "paired":
+        if not is_paired_cloud_loss(self.config.loss.name):
             return
         if self.using_prepared_data:
             dataset = self.loader.dataset

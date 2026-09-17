@@ -190,6 +190,119 @@ class DecoderStage(nn.Module):
         return self.block(torch.cat([x, skip], dim=1))
 
 
+class ImplicitCoordinateDecoder(nn.Module):
+    """Decode every output coordinate with a shared MLP, without learned upsampling.
+
+    The fused low-resolution condition is sampled continuously at the output
+    grid.  Raw current pixels, full-resolution encoder detail, Fourier
+    coordinates, and the spatial latent are then mapped to residual/gate logits
+    by the same pointwise MLP.  There is no transposed convolution or patch
+    unprojection that can assign different kernels to fixed pixel phases.
+    """
+
+    def __init__(
+        self,
+        condition_channels: int,
+        detail_channels: int,
+        image_channels: int,
+        hidden_dim: int,
+        depth: int,
+        fourier_bands: int,
+        chunk_size: int,
+    ) -> None:
+        super().__init__()
+        if hidden_dim < 1 or depth < 1:
+            raise ValueError("implicit hidden_dim and depth must be positive")
+        if fourier_bands < 0:
+            raise ValueError("implicit_fourier_bands cannot be negative")
+        if chunk_size < 1:
+            raise ValueError("implicit_chunk_size must be positive")
+        self.image_channels = image_channels
+        self.fourier_bands = fourier_bands
+        self.chunk_size = chunk_size
+        coordinate_channels = 2 + 4 * fourier_bands
+        input_dim = (
+            condition_channels
+            + detail_channels
+            + image_channels  # current RGB
+            + image_channels  # spatial Gaussian latent
+            + coordinate_channels
+        )
+        layers: list[nn.Module] = [
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, hidden_dim),
+            nn.SiLU(),
+        ]
+        for _ in range(depth - 1):
+            layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.SiLU()])
+        output = nn.Linear(hidden_dim, 2 * image_channels)
+        nn.init.normal_(output.weight, std=1e-3)
+        nn.init.zeros_(output.bias)
+        layers.append(output)
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(
+        self,
+        fused: Tensor,
+        detail: Tensor,
+        current: Tensor,
+        flat_noise: Tensor,
+        samples: int,
+    ) -> tuple[Tensor, Tensor]:
+        batch, _, height, width = current.shape
+        fused_at_pixels = F.interpolate(
+            fused, size=(height, width), mode="bilinear", align_corners=False
+        )
+        condition = torch.cat([fused_at_pixels, detail, current], dim=1)
+        condition = (
+            condition[:, None]
+            .expand(-1, samples, -1, -1, -1)
+            .reshape(batch * samples, condition.shape[1], height, width)
+        )
+        coordinates = _fourier_coordinate_grid(
+            height,
+            width,
+            self.fourier_bands,
+            device=current.device,
+            dtype=current.dtype,
+        ).expand(batch * samples, -1, -1, -1)
+        queries = torch.cat([condition, flat_noise, coordinates], dim=1)
+        queries = queries.permute(0, 2, 3, 1).reshape(-1, queries.shape[1])
+        decoded = torch.cat(
+            [
+                self.mlp(queries[start : start + self.chunk_size])
+                for start in range(0, queries.shape[0], self.chunk_size)
+            ],
+            dim=0,
+        )
+        decoded = decoded.reshape(
+            batch * samples, height, width, 2 * self.image_channels
+        ).permute(0, 3, 1, 2)
+        return decoded.chunk(2, dim=1)
+
+
+def _fourier_coordinate_grid(
+    height: int,
+    width: int,
+    bands: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tensor:
+    y = torch.linspace(-1.0, 1.0, height, device=device, dtype=torch.float32)
+    x = torch.linspace(-1.0, 1.0, width, device=device, dtype=torch.float32)
+    yy, xx = torch.meshgrid(y, x, indexing="ij")
+    coordinates = torch.stack([xx, yy], dim=-1)
+    features = [coordinates]
+    if bands:
+        frequencies = torch.pi * 2.0 ** torch.arange(
+            bands, device=device, dtype=torch.float32
+        )
+        angles = coordinates[..., None] * frequencies
+        features.extend([angles.sin().flatten(-2), angles.cos().flatten(-2)])
+    encoded = torch.cat(features, dim=-1)
+    return encoded.permute(2, 0, 1)[None].to(dtype=dtype)
+
+
 class StochasticImageBridge(nn.Module):
     """Shared encoder, cross-attention, spatial noise, and residual decoder."""
 
@@ -206,6 +319,11 @@ class StochasticImageBridge(nn.Module):
         encoder_type: str = "cnn",
         vit_depth: int = 4,
         vit_patch_size: int = 8,
+        decoder_type: str = "conv",
+        implicit_hidden_dim: int = 128,
+        implicit_depth: int = 3,
+        implicit_fourier_bands: int = 6,
+        implicit_chunk_size: int = 65_536,
         image_size: int | None = None,
         **legacy: object,
     ) -> None:
@@ -265,27 +383,42 @@ class StochasticImageBridge(nn.Module):
         assert isinstance(final_variance_layer, nn.Linear)
         nn.init.zeros_(final_variance_layer.weight)
         nn.init.constant_(final_variance_layer.bias, variance_bias)
-        self.noise_projection = nn.Sequential(
-            nn.Conv2d(in_channels, bottleneck_channels, 3, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(bottleneck_channels, bottleneck_channels, 1),
-        )
         channels = self.encoder.channels  # type: ignore[attr-defined]
-        self.decoder = nn.ModuleList(
-            [
-                DecoderStage(channels[3], channels[2], channels[2]),
-                DecoderStage(channels[2], channels[1], channels[1]),
-                DecoderStage(channels[1], channels[0], channels[0]),
-            ]
-        )
-        self.decoder_noise = nn.ModuleList(
-            [
-                nn.Conv2d(in_channels, channels[2], 3, padding=1),
-                nn.Conv2d(in_channels, channels[1], 3, padding=1),
-                nn.Conv2d(in_channels, channels[0], 3, padding=1),
-            ]
-        )
-        self.output = nn.Conv2d(channels[0], 2 * in_channels, 3, padding=1)
+        normalized_decoder = decoder_type.strip().lower()
+        if normalized_decoder == "conv":
+            self.noise_projection = nn.Sequential(
+                nn.Conv2d(in_channels, bottleneck_channels, 3, padding=1),
+                nn.SiLU(),
+                nn.Conv2d(bottleneck_channels, bottleneck_channels, 1),
+            )
+            self.decoder = nn.ModuleList(
+                [
+                    DecoderStage(channels[3], channels[2], channels[2]),
+                    DecoderStage(channels[2], channels[1], channels[1]),
+                    DecoderStage(channels[1], channels[0], channels[0]),
+                ]
+            )
+            self.decoder_noise = nn.ModuleList(
+                [
+                    nn.Conv2d(in_channels, channels[2], 3, padding=1),
+                    nn.Conv2d(in_channels, channels[1], 3, padding=1),
+                    nn.Conv2d(in_channels, channels[0], 3, padding=1),
+                ]
+            )
+            self.output = nn.Conv2d(channels[0], 2 * in_channels, 3, padding=1)
+        elif normalized_decoder == "implicit":
+            self.implicit_decoder = ImplicitCoordinateDecoder(
+                condition_channels=channels[3],
+                detail_channels=channels[0],
+                image_channels=in_channels,
+                hidden_dim=implicit_hidden_dim,
+                depth=implicit_depth,
+                fourier_bands=implicit_fourier_bands,
+                chunk_size=implicit_chunk_size,
+            )
+        else:
+            raise ValueError("decoder_type must be 'conv' or 'implicit'")
+        self.decoder_type = normalized_decoder
 
     def encode_condition(self, current: Tensor, goal: Tensor) -> tuple[Tensor, list[Tensor]]:
         """Compute deterministic context once before drawing cloud samples."""
@@ -364,29 +497,38 @@ class StochasticImageBridge(nn.Module):
         flat_noise = scaled_noise.reshape(
             batch * samples, self.in_channels, height, width
         )
-        noise_low = F.interpolate(
-            flat_noise, size=fused.shape[-2:], mode="bilinear", align_corners=False
-        )
-        noise_features = self.noise_projection(noise_low)
-        x = fused[:, None].expand(-1, samples, -1, -1, -1).reshape_as(noise_features)
-        x = x + noise_features
-
-        expanded_skips = [
-            feature[:, None]
-            .expand(-1, samples, -1, -1, -1)
-            .reshape(batch * samples, *feature.shape[1:])
-            for feature in current_skips
-        ]
-        for stage, noise_injection, skip in zip(
-            self.decoder, self.decoder_noise, reversed(expanded_skips), strict=True
-        ):
-            x = stage(x, skip)
-            noise_at_scale = F.interpolate(
-                flat_noise, size=x.shape[-2:], mode="bilinear", align_corners=False
+        if self.decoder_type == "conv":
+            noise_low = F.interpolate(
+                flat_noise, size=fused.shape[-2:], mode="bilinear", align_corners=False
             )
-            x = x + noise_injection(noise_at_scale)
-
-        residual_logits, gate_logits = self.output(x).chunk(2, dim=1)
+            noise_features = self.noise_projection(noise_low)
+            x = fused[:, None].expand(-1, samples, -1, -1, -1).reshape_as(
+                noise_features
+            )
+            x = x + noise_features
+            expanded_skips = [
+                feature[:, None]
+                .expand(-1, samples, -1, -1, -1)
+                .reshape(batch * samples, *feature.shape[1:])
+                for feature in current_skips
+            ]
+            for stage, noise_injection, skip in zip(
+                self.decoder, self.decoder_noise, reversed(expanded_skips), strict=True
+            ):
+                x = stage(x, skip)
+                noise_at_scale = F.interpolate(
+                    flat_noise, size=x.shape[-2:], mode="bilinear", align_corners=False
+                )
+                x = x + noise_injection(noise_at_scale)
+            residual_logits, gate_logits = self.output(x).chunk(2, dim=1)
+        else:
+            residual_logits, gate_logits = self.implicit_decoder(
+                fused=fused,
+                detail=current_skips[0],
+                current=current,
+                flat_noise=flat_noise,
+                samples=samples,
+            )
         residual = self.max_residual * torch.tanh(residual_logits)
         gate = torch.sigmoid(gate_logits)
         flat_current = (

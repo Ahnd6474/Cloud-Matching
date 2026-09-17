@@ -96,6 +96,91 @@ class PairedCorrectionLoss(nn.Module):
         return elementwise.mean()
 
 
+class PairedFullBandCloudLoss(nn.Module):
+    """Match paired cloud samples in a complete, shift-preserving frequency pyramid.
+
+    Unlike the pooled features used by :class:`PairedCorrectionLoss`, the
+    undecimated bands below reconstruct the full-resolution error exactly.  A
+    checkerboard or other high-frequency residual therefore cannot disappear
+    through spatial averaging.  Samples retain their analytic posterior-noise
+    pairing, so this is still a coupled cloud objective rather than an
+    unordered set distance.
+    """
+
+    def __init__(
+        self,
+        levels: int = 3,
+        charbonnier_epsilon: float = 1e-3,
+        high_band_weight: float = 1.0,
+        low_band_weight: float = 1.0,
+    ) -> None:
+        super().__init__()
+        if levels < 1:
+            raise ValueError("full-band loss requires at least one level")
+        if charbonnier_epsilon <= 0.0:
+            raise ValueError("charbonnier_epsilon must be positive")
+        if high_band_weight <= 0.0 or low_band_weight <= 0.0:
+            raise ValueError("full-band weights must be positive")
+        self.levels = levels
+        self.charbonnier_epsilon = charbonnier_epsilon
+        self.high_band_weight = high_band_weight
+        self.low_band_weight = low_band_weight
+        # Five-tap binomial filter used by an undecimated (a-trous) pyramid.
+        # Dilation grows with level, but no spatial subsampling is performed.
+        self.register_buffer(
+            "kernel_1d",
+            torch.tensor([1.0, 4.0, 6.0, 4.0, 1.0]) / 16.0,
+            persistent=False,
+        )
+
+    def forward(self, predicted_cloud: Tensor, target_cloud: Tensor, current: Tensor) -> Tensor:
+        if predicted_cloud.shape != target_cloud.shape:
+            raise ValueError("paired full-band loss requires equal cloud shapes")
+        if predicted_cloud.ndim != 5:
+            raise ValueError("clouds must have shape [B, samples, C, H, W]")
+        if current.shape != predicted_cloud[:, 0].shape:
+            raise ValueError("current must have shape [B, C, H, W]")
+
+        # Write this as correction matching to document the coupling semantics.
+        # Algebraically, current cancels and leaves the paired full-image error.
+        error = (predicted_cloud - current[:, None]) - (
+            target_cloud - current[:, None]
+        )
+        detail = error.flatten(0, 1)
+        total = detail.new_zeros(())
+        total_weight = 0.0
+        for level in range(self.levels):
+            smooth = self._atrous_blur(detail, dilation=2**level)
+            band = detail - smooth
+            total = total + self.high_band_weight * self._charbonnier(band)
+            total_weight += self.high_band_weight
+            detail = smooth
+        total = total + self.low_band_weight * self._charbonnier(detail)
+        total_weight += self.low_band_weight
+        return total / total_weight
+
+    def _charbonnier(self, error: Tensor) -> Tensor:
+        epsilon = self.charbonnier_epsilon
+        return (torch.sqrt(error.float().square() + epsilon**2) - epsilon).mean()
+
+    def _atrous_blur(self, image: Tensor, dilation: int) -> Tensor:
+        channels = image.shape[1]
+        kernel = self.kernel_1d.to(device=image.device, dtype=image.dtype)
+        horizontal = kernel.reshape(1, 1, 1, 5).expand(channels, 1, 1, 5)
+        vertical = kernel.reshape(1, 1, 5, 1).expand(channels, 1, 5, 1)
+        padding = 2 * dilation
+        # Replication padding is defined even for tiny smoke-test images where
+        # the largest dilated kernel reaches beyond the opposite boundary.
+        blurred = F.pad(image, (padding, padding, 0, 0), mode="replicate")
+        blurred = F.conv2d(
+            blurred, horizontal, groups=channels, dilation=(1, dilation)
+        )
+        blurred = F.pad(blurred, (0, 0, padding, padding), mode="replicate")
+        return F.conv2d(
+            blurred, vertical, groups=channels, dilation=(dilation, 1)
+        )
+
+
 class EnergyCorrectionCloudLoss(nn.Module):
     """Energy distance between implicit correction ensembles."""
 
@@ -121,12 +206,32 @@ def _cloud_features(features: nn.Module, cloud: Tensor) -> Tensor:
     return features(flat_cloud).reshape(batch, samples, -1)
 
 
-def build_cloud_loss(name: str, blur: float = 0.05) -> nn.Module:
+def is_paired_cloud_loss(name: str) -> bool:
+    return name.strip().lower() in {"paired", "paired_full_band"}
+
+
+def build_cloud_loss(
+    name: str,
+    blur: float = 0.05,
+    full_band_levels: int = 3,
+    full_band_charbonnier_epsilon: float = 1e-3,
+    full_band_high_weight: float = 1.0,
+    full_band_low_weight: float = 1.0,
+) -> nn.Module:
     normalized = name.strip().lower()
     if normalized == "paired":
         return PairedCorrectionLoss()
+    if normalized == "paired_full_band":
+        return PairedFullBandCloudLoss(
+            levels=full_band_levels,
+            charbonnier_epsilon=full_band_charbonnier_epsilon,
+            high_band_weight=full_band_high_weight,
+            low_band_weight=full_band_low_weight,
+        )
     if normalized == "energy":
         return EnergyCorrectionCloudLoss()
     if normalized == "sinkhorn":
         return SinkhornCorrectionCloudLoss(blur=blur)
-    raise ValueError(f"unknown loss '{name}'; choose paired, energy, or sinkhorn")
+    raise ValueError(
+        f"unknown loss '{name}'; choose paired, paired_full_band, energy, or sinkhorn"
+    )

@@ -19,6 +19,7 @@ class DataConfig:
     workers: int = 0
     prefetch_factor: int = 2
     random_crop: bool = True
+    crop_mode: str = "resized"
     horizontal_flip: bool = True
 
 
@@ -93,6 +94,11 @@ class ModelConfig:
     encoder_type: str = "cnn"
     vit_depth: int = 4
     vit_patch_size: int = 8
+    decoder_type: str = "conv"
+    implicit_hidden_dim: int = 128
+    implicit_depth: int = 3
+    implicit_fourier_bands: int = 6
+    implicit_chunk_size: int = 65536
 
 
 @dataclass
@@ -100,6 +106,10 @@ class LossConfig:
     name: str = "energy"
     samples: int = 4
     sinkhorn_blur: float = 0.05
+    full_band_levels: int = 3
+    full_band_charbonnier_epsilon: float = 1e-3
+    full_band_high_weight: float = 1.0
+    full_band_low_weight: float = 1.0
 
 
 @dataclass

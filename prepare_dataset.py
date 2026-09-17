@@ -6,7 +6,8 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch import Tensor
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from stochastic_bridge.config import load_config
@@ -14,8 +15,25 @@ from stochastic_bridge.corruptions import GoalDetailCorruptor
 from stochastic_bridge.data import build_bridge_batch
 from stochastic_bridge.datasets import ImageDirectoryDataset, SyntheticImageDataset
 from stochastic_bridge.noise import CorruptionMixture, SUPPORTED_CORRUPTIONS
+from stochastic_bridge.losses import is_paired_cloud_loss
 from stochastic_bridge.prepared import PreparedShardWriter
 from stochastic_bridge.schedule import VPNoiseSchedule
+
+
+class VariantBatchDataset(Dataset[Tensor]):
+    """Return all random variants after decoding each source image once."""
+
+    def __init__(self, source: Dataset[Tensor], variants: int) -> None:
+        self.source = source
+        self.variants = variants
+
+    def __len__(self) -> int:
+        return len(self.source)
+
+    def __getitem__(self, index: int) -> Tensor:
+        if isinstance(self.source, ImageDirectoryDataset):
+            return self.source.sample_variants(index, self.variants)
+        return torch.stack([self.source[index] for _ in range(self.variants)])
 
 
 def parse_args() -> argparse.Namespace:
@@ -57,11 +75,12 @@ def main() -> None:
             config.data.root,
             config.data.image_size,
             random_crop=config.data.random_crop,
+            crop_mode=config.data.crop_mode,
             horizontal_flip=config.data.horizontal_flip,
         )
     )
     loader = DataLoader(
-        source,
+        VariantBatchDataset(source, variants),
         batch_size=config.prepare.batch_size,
         shuffle=False,
         num_workers=config.prepare.workers,
@@ -89,7 +108,7 @@ def main() -> None:
     goal_corruptor = (
         GoalDetailCorruptor(**goal_values).to(device) if goal_enabled else None
     )
-    if mixture is not None and config.loss.name.lower() == "paired":
+    if mixture is not None and is_paired_cloud_loss(config.loss.name):
         raise ValueError("paired loss cannot generate a mixed-corruption dataset")
 
     writer = PreparedShardWriter(
@@ -107,21 +126,20 @@ def main() -> None:
             "config": config.to_dict(),
         },
     )
-    progress = tqdm(total=len(loader) * variants, desc="preparing fixed dataset")
+    progress = tqdm(total=len(loader), desc="preparing fixed dataset")
     with torch.inference_mode():
-        for _ in range(variants):
-            for clean in loader:
-                clean = clean.to(device, non_blocking=True)
-                batch = build_bridge_batch(
-                    clean,
-                    schedule,
-                    target_samples=config.loss.samples,
-                    answer_jump=config.schedule.answer_jump,
-                    goal_corruptor=goal_corruptor,
-                    corruption_mixture=mixture,
-                )
-                writer.add_batch(batch)
-                progress.update(1)
+        for clean_variants in loader:
+            clean = clean_variants.flatten(0, 1).to(device, non_blocking=True)
+            batch = build_bridge_batch(
+                clean,
+                schedule,
+                target_samples=config.loss.samples,
+                answer_jump=config.schedule.answer_jump,
+                goal_corruptor=goal_corruptor,
+                corruption_mixture=mixture,
+            )
+            writer.add_batch(batch)
+            progress.update(1)
     progress.close()
     manifest = writer.finalize()
     print(f"records: {len(source) * variants}")
