@@ -4,6 +4,7 @@ import torch
 import pytest
 
 from stochastic_bridge import (
+    CorruptionMixture,
     EnergyCorrectionCloudLoss,
     PairedFullBandCloudLoss,
     PairedCorrectionLoss,
@@ -30,6 +31,26 @@ def test_level_triplet_rule() -> None:
     )
     assert torch.all(current > goal)
     assert torch.all(answer == (goal - 10).clamp_min(0))
+
+
+def test_level_triplet_can_force_clean_answers() -> None:
+    current, goal, answer = sample_level_triplet(
+        batch_size=128,
+        max_level=100,
+        answer_jump=10,
+        clean_answer_probability=1.0,
+    )
+    assert torch.all(current > goal)
+    assert torch.count_nonzero(answer) == 0
+
+
+def test_level_triplet_rejects_invalid_clean_probability() -> None:
+    with pytest.raises(ValueError, match="clean_answer_probability"):
+        sample_level_triplet(
+            batch_size=2,
+            max_level=100,
+            clean_answer_probability=1.01,
+        )
 
 
 def test_clean_answer_cloud_is_a_point_mass() -> None:
@@ -143,6 +164,32 @@ def test_training_batch_contains_reparameterization_noise() -> None:
     torch.testing.assert_close(batch.target_cloud, expected)
     assert batch.goal.shape == clean.shape
     assert torch.all(batch.current_level > batch.goal_level)
+
+
+def test_structured_corruption_is_safe_for_paired_clean_endpoint() -> None:
+    torch.manual_seed(21)
+    schedule = VPNoiseSchedule(steps=100)
+    clean = torch.rand(4, 3, 32, 32) * 2.0 - 1.0
+    endpoint_mixture = CorruptionMixture(
+        schedule,
+        {"texture_suppress": 1.0, "edge_erase": 1.0},
+    )
+    batch = build_bridge_batch(
+        clean,
+        schedule,
+        target_samples=3,
+        clean_answer_probability=1.0,
+        endpoint_corruption_mixture=endpoint_mixture,
+        endpoint_corruption_probability=1.0,
+    )
+
+    assert torch.count_nonzero(batch.answer_level) == 0
+    expected = clean[:, None].expand_as(batch.target_cloud)
+    torch.testing.assert_close(batch.target_cloud, expected, atol=1e-6, rtol=1e-6)
+    assert batch.target_noise is not None
+    assert batch.corruption_types is not None
+    assert set(batch.corruption_types) <= {"texture_suppress", "edge_erase"}
+    assert not torch.equal(batch.current, clean)
 
 
 def test_paired_and_energy_losses_backpropagate() -> None:

@@ -78,6 +78,14 @@ def main() -> None:
         if mixture_enabled
         else None
     )
+    endpoint_config = config.endpoint_corruption.__dict__.copy()
+    endpoint_enabled = endpoint_config.pop("enabled")
+    endpoint_probability = endpoint_config.pop("probability")
+    endpoint_mixture = (
+        CorruptionMixture(schedule=schedule, **endpoint_config)
+        if endpoint_enabled and endpoint_probability > 0.0
+        else None
+    )
     batch = build_bridge_batch(
         clean,
         schedule,
@@ -85,6 +93,9 @@ def main() -> None:
         answer_jump=config.schedule.answer_jump,
         goal_corruptor=corruptor,
         corruption_mixture=mixture,
+        clean_answer_probability=config.schedule.clean_answer_probability,
+        endpoint_corruption_mixture=endpoint_mixture,
+        endpoint_corruption_probability=endpoint_probability,
     )
     rows = torch.cat(
         [clean, batch.current, batch.goal, batch.target_cloud[:, 0]], dim=0

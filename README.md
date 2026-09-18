@@ -9,7 +9,9 @@ reuses it across all training epochs.
 For every clean image `x0`, training data is produced on the fly:
 
 1. Sample an input level `s` and goal-image level `r` with `s > r`.
-2. Set the requested answer level to `a = max(r - 10, 0)`.
+2. Usually set the requested answer level to `a = max(r - 10, 0)`. The
+   configurable endpoint curriculum can instead force `a = 0` for a chosen
+   fraction of examples, explicitly training arbitrary `x_n -> x_0` recovery.
 3. Select one corruption family per item and independently create the current
    image `x_s` and image goal `x_r` at their respective severities.
 4. Optionally remove additional detail from the image goal with blur,
@@ -32,7 +34,8 @@ automatically.
   channel-correlated, low-rank, anisotropic, and signal-dependent.
 - Heavy-tailed/additive: Student-t and Laplace.
 - Camera-like: Poisson shot noise and multiplicative speckle.
-- Structural: salt-and-pepper impulse, blur, downsample/upsample, and block mask.
+- Structural: salt-and-pepper impulse, blur, downsample/upsample, block mask,
+  texture-only suppression, and edge/line erasure.
 
 All implementations are batched PyTorch operations and remain on the selected
 device. The core tensor/distribution primitives come from PyTorch; GeomLoss is
@@ -57,7 +60,9 @@ used for Sinkhorn divergence.
 Change `loss.name` in `configs/train.yaml`:
 
 - `paired`: same posterior noise is used by model and target; available only
-  when `corruption.enabled: false` selects the analytic VP Gaussian path.
+  when `corruption.enabled: false` selects the analytic VP Gaussian path. It
+  also supports structured damage on clean-endpoint examples because their
+  target cloud is the exact point mass at `x_0`.
 - `paired_full_band`: the same analytic noise pairing, evaluated over a
   complete stride-free a-trous frequency pyramid. Unlike pooled features, it
   retains full-resolution checkerboard, edge, and texture errors.
@@ -95,6 +100,25 @@ forward process then uses VP Gaussian noise and composes the interval between
 answer level `a` and input level `s` into the analytic teacher distribution
 `q(x_a | x_s, x_0)`. The model architecture itself is unchanged and is not
 restricted to Gaussian outputs.
+
+## Clean-endpoint and structured-detail curriculum
+
+`configs/kaggle_div2k_structured_endpoint.yaml` is the recommended follow-up
+to the Gaussian reconstruction experiment. It keeps ordinary intermediate
+transitions analytic, while forcing roughly 60% of sampled transitions to
+answer at `x_0`. A configurable fraction of those endpoint examples replace
+the Gaussian input with one of the following degradations:
+
+- `texture_suppress`: detects local high-frequency energy away from strong
+  boundaries and selectively smooths it.
+- `edge_erase`: detects and dilates lines/boundaries, then replaces only that
+  band with a local low-pass estimate.
+- Local, edge-weighted, and high-frequency Gaussian noise, blur, downsample,
+  and masks remain in the mixture for coverage.
+
+Because every structured example targets clean `x_0`, it remains compatible
+with `paired_full_band`; no fictitious non-Gaussian intermediate posterior is
+introduced.
 
 ## Installation
 
@@ -209,25 +233,28 @@ TensorBoard:
 .\.venv\Scripts\tensorboard.exe --logdir runs
 ```
 
-## Kaggle DIV2K Gaussian-only experiment
+## Kaggle DIV2K structured-endpoint experiment
 
 Open [`notebooks/div2k_gaussian_only_kaggle.ipynb`](notebooks/div2k_gaussian_only_kaggle.ipynb)
 in Kaggle, select the **T4 x2** accelerator, enable Internet, and run all cells.
-The notebook downloads DIV2K with `kagglehub`, prepares a fixed Gaussian-only
-dataset, and launches `torchrun` with one process per visible GPU. Its output
-includes checkpoints, training curves, corruption/severity comparisons, cloud
-distribution plots, uncertainty maps, and a 40-step fixed-goal rollout with
-per-step image and hidden-feature similarity metrics.
+The notebook downloads DIV2K with `kagglehub`, prepares a fixed native-128
+hybrid dataset, and launches `torchrun` with one process per visible GPU. It
+checks clean-endpoint and corruption-family counts before training. Its output
+includes checkpoints, training curves, Gaussian-severity and structured-
+corruption comparisons, cloud distribution plots, uncertainty maps, and a
+40-step fixed-goal rollout with per-step image and hidden-feature metrics.
 
 The full experiment prepares 16 transitions per DIV2K training image (12,800
-fixed records) and trains for 60 epochs, or roughly 24,000 optimizer updates at
-global batch size 32. It uses versioned output and cache directories so the old
-20-epoch cosine-scheduler checkpoint is not resumed accidentally.
+fixed records) and trains for 60 epochs, or roughly 48,000 optimizer updates at
+global batch size 16. It uses versioned output and cache directories so an old
+Gaussian checkpoint is not resumed accidentally. Set the notebook's optional
+`INIT_CHECKPOINT` path to warm-start its model weights without restoring the
+old optimizer or scheduler.
 
 The standalone launcher and full-size experiment settings are:
 
 - `kaggle/train_div2k_ddp.py`
-- `configs/kaggle_div2k_gaussian.yaml`
+- `configs/kaggle_div2k_structured_endpoint.yaml`
 
 Because the notebook clones this repository, commit and push these files before
 starting a Kaggle run (or attach an updated repository snapshot as a Kaggle

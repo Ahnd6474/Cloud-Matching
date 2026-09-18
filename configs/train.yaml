@@ -28,6 +28,7 @@ schedule:
   beta_start: 0.0001
   beta_end: 0.02
   answer_jump: 10
+  clean_answer_probability: 0.60
 
 corruption:
   # Weights are relative probabilities; set a type to 0 to disable it.
@@ -54,6 +55,8 @@ corruption:
     blur: 3
     downsample: 3
     mask: 3
+    texture_suppress: 3
+    edge_erase: 3
 
 goal_corruption:
   enabled: true

@@ -103,6 +103,17 @@ def main() -> None:
         if corruption.enabled
         else None
     )
+    endpoint = config.endpoint_corruption
+    endpoint_mixture = (
+        CorruptionMixture(
+            schedule,
+            endpoint.weights,
+            endpoint.spatial_floor,
+            endpoint.student_t_df,
+        ).to(device)
+        if endpoint.enabled and endpoint.probability > 0.0
+        else None
+    )
     goal_values = config.goal_corruption.__dict__.copy()
     goal_enabled = goal_values.pop("enabled")
     goal_corruptor = (
@@ -137,6 +148,9 @@ def main() -> None:
                 answer_jump=config.schedule.answer_jump,
                 goal_corruptor=goal_corruptor,
                 corruption_mixture=mixture,
+                clean_answer_probability=config.schedule.clean_answer_probability,
+                endpoint_corruption_mixture=endpoint_mixture,
+                endpoint_corruption_probability=endpoint.probability,
             )
             writer.add_batch(batch)
             progress.update(1)

@@ -53,6 +53,11 @@ class Trainer:
         self.corruption_mixture = (
             None if self.using_prepared_data else self._build_corruption_mixture()
         )
+        self.endpoint_corruption_mixture = (
+            None
+            if self.using_prepared_data
+            else self._build_endpoint_corruption_mixture()
+        )
         self.goal_corruptor = (
             None if self.using_prepared_data else self._build_goal_corruptor()
         )
@@ -118,6 +123,13 @@ class Trainer:
                     answer_jump=self.config.schedule.answer_jump,
                     goal_corruptor=self.goal_corruptor,
                     corruption_mixture=self.corruption_mixture,
+                    clean_answer_probability=(
+                        self.config.schedule.clean_answer_probability
+                    ),
+                    endpoint_corruption_mixture=self.endpoint_corruption_mixture,
+                    endpoint_corruption_probability=(
+                        self.config.endpoint_corruption.probability
+                    ),
                 )
             paired = is_paired_cloud_loss(self.config.loss.name)
             model_noise = bridge.target_noise if paired else None
@@ -272,6 +284,17 @@ class Trainer:
     def _build_corruption_mixture(self) -> CorruptionMixture | None:
         corruption = self.config.corruption
         if not corruption.enabled:
+            return None
+        return CorruptionMixture(
+            schedule=self.schedule,
+            weights=corruption.weights,
+            spatial_floor=corruption.spatial_floor,
+            student_t_df=corruption.student_t_df,
+        ).to(self.device)
+
+    def _build_endpoint_corruption_mixture(self) -> CorruptionMixture | None:
+        corruption = self.config.endpoint_corruption
+        if not corruption.enabled or corruption.probability <= 0.0:
             return None
         return CorruptionMixture(
             schedule=self.schedule,

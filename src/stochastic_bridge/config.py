@@ -38,6 +38,9 @@ class ScheduleConfig:
     beta_start: float = 1e-4
     beta_end: float = 2e-2
     answer_jump: int = 10
+    # In addition to ordinary short bridge transitions, explicitly train a
+    # substantial fraction of arbitrary noisy states to terminate at x_0.
+    clean_answer_probability: float = 0.0
 
 
 @dataclass
@@ -77,6 +80,33 @@ class CorruptionConfig:
             "blur": 3.0,
             "downsample": 3.0,
             "mask": 3.0,
+        }
+    )
+
+
+@dataclass
+class EndpointCorruptionConfig:
+    """Structured degradations used only when the requested answer is clean.
+
+    Restricting these non-VP corruptions to x_0 targets keeps the target a
+    point mass.  They can therefore be mixed with analytically paired VP
+    transitions without inventing an invalid intermediate posterior.
+    """
+
+    enabled: bool = False
+    probability: float = 0.0
+    spatial_floor: float = 0.08
+    student_t_df: float = 3.0
+    weights: dict[str, float] = field(
+        default_factory=lambda: {
+            "local_gaussian": 2.0,
+            "edge_gaussian": 2.0,
+            "high_frequency_gaussian": 1.0,
+            "texture_suppress": 3.0,
+            "edge_erase": 3.0,
+            "blur": 1.0,
+            "downsample": 1.0,
+            "mask": 1.0,
         }
     )
 
@@ -139,6 +169,9 @@ class ExperimentConfig:
     prepare: PrepareConfig = field(default_factory=PrepareConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
     corruption: CorruptionConfig = field(default_factory=CorruptionConfig)
+    endpoint_corruption: EndpointCorruptionConfig = field(
+        default_factory=EndpointCorruptionConfig
+    )
     goal_corruption: GoalCorruptionConfig = field(default_factory=GoalCorruptionConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     loss: LossConfig = field(default_factory=LossConfig)
@@ -160,6 +193,9 @@ def config_from_dict(raw: dict[str, Any]) -> ExperimentConfig:
         prepare=PrepareConfig(**raw.get("prepare", {})),
         schedule=ScheduleConfig(**raw.get("schedule", {})),
         corruption=CorruptionConfig(**raw.get("corruption", {})),
+        endpoint_corruption=EndpointCorruptionConfig(
+            **raw.get("endpoint_corruption", {})
+        ),
         goal_corruption=GoalCorruptionConfig(**raw.get("goal_corruption", {})),
         model=ModelConfig(**raw.get("model", {})),
         loss=LossConfig(**raw.get("loss", {})),

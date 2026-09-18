@@ -25,6 +25,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run", type=Path, required=True)
     parser.add_argument("--validation", type=Path, required=True)
     parser.add_argument("--checkpoint", default="best.pt")
+    parser.add_argument(
+        "--baseline-checkpoint",
+        type=Path,
+        help="Optional earlier checkpoint for a paired visual comparison",
+    )
     parser.add_argument("--sample-index", type=int, default=0)
     parser.add_argument("--cloud-samples", type=int, default=16)
     parser.add_argument("--rollout-paths", type=int, default=4)
@@ -112,6 +117,74 @@ def main() -> None:
 
     dataset = PreparedBridgeDataset(args.validation)
     clean = dataset[args.sample_index]["clean"][None].to(device)
+
+    if args.baseline_checkpoint is not None:
+        baseline_state = torch.load(
+            args.baseline_checkpoint.expanduser().resolve(),
+            map_location=device,
+            weights_only=False,
+        )
+        baseline_config = config_from_dict(baseline_state["config"])
+        baseline_model = StochasticImageBridge(**baseline_config.model.__dict__).to(device)
+        baseline_model.load_state_dict(baseline_state["model"])
+        baseline_model.eval()
+        records = [dataset[index] for index in range(min(4, len(dataset)))]
+        compare_clean = torch.stack([record["clean"] for record in records]).to(device)
+        compare_current = torch.stack([record["current"] for record in records]).to(device)
+        compare_goal = torch.stack([record["goal"] for record in records]).to(device)
+        compare_noise = torch.stack([record["target_noise"] for record in records]).to(device)
+        compare_target = torch.stack([record["target_cloud"] for record in records]).to(device)
+        with torch.inference_mode(), autocast_context(device):
+            baseline_output = baseline_model(
+                compare_current,
+                compare_goal,
+                samples=compare_noise.shape[1],
+                noise=compare_noise,
+            ).float().mean(1)
+            fine_tuned_output = model(
+                compare_current,
+                compare_goal,
+                samples=compare_noise.shape[1],
+                noise=compare_noise,
+            ).float().mean(1)
+        target_mean = compare_target.mean(1)
+        baseline_psnr = image_psnr(baseline_output, compare_clean)
+        fine_tuned_psnr = image_psnr(fine_tuned_output, compare_clean)
+        comparison = {
+            "baseline_mean_psnr": baseline_psnr.mean().item(),
+            "fine_tuned_mean_psnr": fine_tuned_psnr.mean().item(),
+            "mean_psnr_delta": (fine_tuned_psnr - baseline_psnr).mean().item(),
+        }
+        (output_dir / "checkpoint_comparison.json").write_text(
+            json.dumps(comparison, indent=2), encoding="utf-8"
+        )
+        fig, axes = plt.subplots(len(records), 6, figsize=(16, 2.8 * len(records)))
+        for row in range(len(records)):
+            values = [
+                compare_clean[row],
+                compare_current[row],
+                compare_goal[row],
+                target_mean[row],
+                baseline_output[row],
+                fine_tuned_output[row],
+            ]
+            titles = [
+                "clean native crop",
+                "current",
+                "goal",
+                "target mean",
+                f"64px weights\n{baseline_psnr[row]:.2f} dB",
+                f"native-128 tuned\n{fine_tuned_psnr[row]:.2f} dB",
+            ]
+            for column, (value, title) in enumerate(zip(values, titles, strict=True)):
+                axes[row, column].imshow(to_image(value))
+                axes[row, column].axis("off")
+                if row == 0 or column >= 4:
+                    axes[row, column].set_title(title)
+        fig.tight_layout()
+        fig.savefig(output_dir / "00_checkpoint_comparison.png", dpi=180)
+        plt.close(fig)
+        del baseline_model
 
     @torch.inference_mode()
     def evaluate_level(level: int) -> dict[str, torch.Tensor | int]:

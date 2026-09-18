@@ -1,0 +1,109 @@
+data:
+  root: ""
+  prepared_root: ""
+  prepared_cache_shards: 4
+  synthetic: false
+  synthetic_length: 32
+  image_size: 128
+  batch_size: 8
+  workers: 2
+  prefetch_factor: 2
+  random_crop: true
+  crop_mode: native
+  horizontal_flip: true
+
+prepare:
+  # Prefer fresh native crops over repeatedly training on a tiny fixed set.
+  variants_per_image: 16
+  shard_size: 64
+  batch_size: 8
+  workers: 2
+  seed: 17
+
+schedule:
+  steps: 100
+  beta_start: 0.0001
+  beta_end: 0.02
+  answer_jump: 10
+  # Roughly 60% forced plus the naturally sampled low goal levels means that
+  # about two thirds of records directly learn x_n -> x_0.
+  clean_answer_probability: 0.60
+
+# Keep ordinary non-endpoint transitions on the exact analytic VP path.
+corruption:
+  enabled: false
+  spatial_floor: 0.08
+  student_t_df: 3.0
+  weights:
+    white_gaussian: 1
+
+# Selected clean-endpoint examples replace Gaussian corruption with damage
+# that removes a particular kind of visual information.
+endpoint_corruption:
+  enabled: true
+  probability: 0.60
+  spatial_floor: 0.08
+  student_t_df: 3.0
+  weights:
+    local_gaussian: 2
+    edge_gaussian: 2
+    high_frequency_gaussian: 1
+    texture_suppress: 3
+    edge_erase: 3
+    blur: 1
+    downsample: 1
+    mask: 1
+
+goal_corruption:
+  enabled: false
+  blur_probability: 0.0
+  downsample_probability: 0.0
+  mask_probability: 0.0
+  minimum_scale: 0.25
+  maximum_mask_fraction: 0.30
+
+model:
+  encoder_type: cnn
+  decoder_type: implicit
+  in_channels: 3
+  base_channels: 32
+  heads: 8
+  attention_depth: 2
+  max_residual: 1.0
+  noise_variance_min: 0.0001
+  noise_variance_max: 1.0
+  noise_variance_init: 0.1
+  vit_depth: 4
+  vit_patch_size: 8
+  implicit_hidden_dim: 128
+  implicit_depth: 3
+  implicit_fourier_bands: 6
+  implicit_chunk_size: 65536
+
+loss:
+  name: paired_full_band
+  samples: 4
+  sinkhorn_blur: 0.05
+  full_band_levels: 3
+  full_band_charbonnier_epsilon: 0.001
+  full_band_high_weight: 1.25
+  full_band_low_weight: 1.0
+
+train:
+  epochs: 60
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  amp: true
+  amp_dtype: float16
+  channels_last: true
+  tf32: true
+  fused_optimizer: true
+  compile: false
+  compile_mode: reduce-overhead
+  seed: 17
+  log_every: 20
+  preview_every: 200
+  save_every: 1000
+  output_dir: "/kaggle/working/cloud_matching_div2k_structured_endpoint"
+  resume: ""

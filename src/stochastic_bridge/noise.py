@@ -30,6 +30,8 @@ SUPPORTED_CORRUPTIONS = (
     "blur",
     "downsample",
     "mask",
+    "texture_suppress",
+    "edge_erase",
 )
 
 
@@ -166,6 +168,10 @@ class CorruptionMixture(nn.Module):
             return self._downsample(clean, severity)
         if name == "mask":
             return self._random_mask(clean, severity)
+        if name == "texture_suppress":
+            return self._texture_suppress(clean, severity)
+        if name == "edge_erase":
+            return self._edge_erase(clean, severity)
         raise AssertionError("unreachable")
 
     @staticmethod
@@ -214,6 +220,32 @@ class CorruptionMixture(nn.Module):
         magnitude = magnitude / magnitude.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
         magnitude = F.max_pool2d(magnitude, kernel_size=5, stride=1, padding=2)
         return self._gaussian_blur(magnitude, sigma=1.0).clamp(0.0, 1.0)
+
+    def _texture_mask(self, reference: Tensor) -> Tensor:
+        """Softly select high-frequency texture while excluding strong edges."""
+        gray = reference.mean(dim=1, keepdim=True)
+        high_frequency = (gray - self._gaussian_blur(gray, sigma=1.2)).abs()
+        local_energy = self._gaussian_blur(high_frequency, sigma=1.0)
+        scale = local_energy.mean(dim=(-2, -1), keepdim=True).clamp_min(1e-5)
+        texture = (local_energy / (3.0 * scale)).clamp(0.0, 1.0)
+        # Object boundaries and thin lines belong to the complementary edge
+        # corruption; keeping them here makes this operator texture-specific.
+        texture = texture * (1.0 - self._edge_mask(reference)).square()
+        return self._gaussian_blur(texture, sigma=0.7).clamp(0.0, 1.0)
+
+    def _texture_suppress(self, clean: Tensor, severity: float) -> Tensor:
+        smooth = self._gaussian_blur(clean, sigma=0.5 + 2.5 * severity)
+        mask = self._texture_mask(clean) * severity
+        return clean * (1.0 - mask) + smooth * mask
+
+    def _edge_erase(self, clean: Tensor, severity: float) -> Tensor:
+        # Replace only a dilated soft band around lines/boundaries with a local
+        # low-pass estimate. Flat areas and most stochastic texture survive.
+        edge = self._edge_mask(clean)
+        edge = F.max_pool2d(edge, kernel_size=3, stride=1, padding=1)
+        mask = (edge * severity).clamp(0.0, 1.0)
+        smooth = self._gaussian_blur(clean, sigma=0.8 + 3.2 * severity)
+        return clean * (1.0 - mask) + smooth * mask
 
     def _low_frequency_noise(self, reference: Tensor, divisor: int) -> Tensor:
         height, width = reference.shape[-2:]
