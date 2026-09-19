@@ -18,7 +18,11 @@ from .config import ExperimentConfig
 from .corruptions import GoalDetailCorruptor
 from .data import BridgeBatch, build_bridge_batch
 from .datasets import ImageDirectoryDataset, SyntheticImageDataset
-from .losses import build_cloud_loss, is_paired_cloud_loss
+from .losses import (
+    SpatialNoiseCrossEntropyLoss,
+    build_cloud_loss,
+    is_paired_cloud_loss,
+)
 from .model import StochasticImageBridge
 from .noise import CorruptionMixture
 from .prepared import PreparedBridgeDataset, ShardBatchSampler
@@ -64,7 +68,9 @@ class Trainer:
         self._validate_loss_data_compatibility()
         self.model = StochasticImageBridge(**config.model.__dict__).to(self.device)
         self.use_channels_last = (
-            config.train.channels_last and config.model.encoder_type.lower() == "cnn"
+            config.train.channels_last
+            and config.model.architecture.lower() == "pyramid"
+            and config.model.encoder_type.lower() == "cnn"
         )
         if self.use_channels_last:
             self.model.to(memory_format=torch.channels_last)
@@ -77,6 +83,18 @@ class Trainer:
             full_band_high_weight=config.loss.full_band_high_weight,
             full_band_low_weight=config.loss.full_band_low_weight,
         ).to(self.device)
+        self.spatial_criterion = (
+            SpatialNoiseCrossEntropyLoss(
+                highpass=config.loss.spatial_ce_highpass,
+                kernel_size=config.loss.spatial_ce_kernel_size,
+            ).to(self.device)
+            if config.loss.spatial_ce_weight > 0.0
+            else None
+        )
+        if self.spatial_criterion is not None and config.model.architecture != "fullres_axial":
+            raise ValueError(
+                "loss.spatial_ce_weight requires model.architecture=fullres_axial"
+            )
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=config.train.learning_rate,
@@ -86,7 +104,10 @@ class Trainer:
         amp_enabled = config.train.amp and self.device.type == "cuda"
         self.amp_dtype = self._amp_dtype(config.train.amp_dtype)
         self.scaler = torch.amp.GradScaler(
-            "cuda", enabled=amp_enabled and self.amp_dtype == torch.float16
+            "cuda",
+            enabled=amp_enabled and self.amp_dtype == torch.float16,
+            init_scale=config.train.amp_init_scale,
+            growth_interval=config.train.amp_growth_interval,
         )
         self.amp_enabled = amp_enabled
         self.writer = SummaryWriter(self.output_dir / "tensorboard")
@@ -144,11 +165,22 @@ class Trainer:
                     samples=self.config.loss.samples,
                     noise=model_noise,
                     return_noise_variance=True,
+                    return_noise_energy=self.spatial_criterion is not None,
                 )
                 if not isinstance(model_output, tuple):
                     raise RuntimeError("model did not return its noise variance")
-                predicted, noise_variance = model_output
-                loss = self.criterion(predicted, bridge.target_cloud, bridge.current)
+                predicted, noise_variance = model_output[:2]
+                cloud_loss = self.criterion(
+                    predicted, bridge.target_cloud, bridge.current
+                )
+                spatial_loss = cloud_loss.new_zeros(())
+                if self.spatial_criterion is not None:
+                    if len(model_output) != 3:
+                        raise RuntimeError("model did not return spatial noise energy")
+                    spatial_loss = self.spatial_criterion(
+                        model_output[2], bridge.target_cloud, bridge.current
+                    )
+                loss = cloud_loss + self.config.loss.spatial_ce_weight * spatial_loss
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -162,6 +194,13 @@ class Trainer:
                 loss_value = loss.detach().item()
                 progress.set_postfix(loss=f"{loss_value:.4f}")
                 self.writer.add_scalar("train/loss", loss_value, self.global_step)
+                self.writer.add_scalar(
+                    "train/cloud_loss", cloud_loss.detach().item(), self.global_step
+                )
+                if self.spatial_criterion is not None:
+                    self.writer.add_scalar(
+                        "train/spatial_ce", spatial_loss.detach().item(), self.global_step
+                    )
                 self.writer.add_scalar(
                     "train/gradient_norm", float(grad_norm), self.global_step
                 )

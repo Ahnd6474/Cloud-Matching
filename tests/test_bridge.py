@@ -6,8 +6,10 @@ import pytest
 from stochastic_bridge import (
     CorruptionMixture,
     EnergyCorrectionCloudLoss,
+    FullBandEnergyCorrectionCloudLoss,
     PairedFullBandCloudLoss,
     PairedCorrectionLoss,
+    SpatialNoiseCrossEntropyLoss,
     SinkhornCorrectionCloudLoss,
     StochasticImageBridge,
     VPNoiseSchedule,
@@ -321,3 +323,83 @@ def test_implicit_coordinate_decoder_supports_both_encoders(encoder_type: str) -
         parameter.grad is not None and parameter.grad.abs().sum().item() > 0.0
         for parameter in model.noise_variance_head.parameters()
     )
+
+
+def test_full_resolution_axial_bridge_is_pixel_aligned_and_trainable() -> None:
+    torch.manual_seed(37)
+    model = StochasticImageBridge(
+        architecture="fullres_axial",
+        in_channels=3,
+        heads=4,
+        noise_variance_min=1e-4,
+        noise_variance_max=1.0,
+        noise_variance_init=0.1,
+        fullres_dim=32,
+        fullres_depth=4,
+        fullres_cross_depth=1,
+        fullres_ffn_ratio=2.0,
+        fullres_window_size=4,
+        fullres_gradient_checkpointing=False,
+    )
+    # Deliberately not divisible by 8: this path has no spatial bottleneck.
+    current = torch.randn(2, 3, 10, 14).clamp(-1.0, 1.0)
+    goal = torch.randn(2, 3, 10, 14).clamp(-1.0, 1.0)
+    output = model(
+        current,
+        goal,
+        samples=3,
+        return_noise_variance=True,
+        return_noise_energy=True,
+    )
+    assert isinstance(output, tuple) and len(output) == 3
+    cloud, average_energy, spatial_energy = output
+    assert cloud.shape == (2, 3, 3, 10, 14)
+    assert average_energy.shape == (2,)
+    assert spatial_energy.shape == (2, 10, 14)
+    torch.testing.assert_close(
+        average_energy, spatial_energy.mean(dim=(-2, -1))
+    )
+    torch.testing.assert_close(
+        spatial_energy, torch.full_like(spatial_energy, 0.1)
+    )
+
+    target = torch.randn_like(cloud).clamp(-1.0, 1.0)
+    loss = EnergyCorrectionCloudLoss()(cloud, target, current)
+    loss.backward()
+    assert any(
+        parameter.grad is not None and parameter.grad.abs().sum().item() > 0.0
+        for parameter in model.fullres.energy_head.parameters()
+    )
+    assert model.decoder_type == "linear_pixel"
+    assert not any(
+        isinstance(module, (torch.nn.Conv2d, torch.nn.ConvTranspose2d))
+        for module in model.fullres.modules()
+    )
+
+
+def test_spatial_noise_ce_teaches_relative_location_not_strength() -> None:
+    current = torch.zeros(1, 3, 8, 8)
+    target = current[:, None].repeat(1, 2, 1, 1, 1)
+    target[:, :, :, 2:4, 5:7] = 1.0
+    concentrated = torch.full((1, 8, 8), 0.01)
+    concentrated[:, 2:4, 5:7] = 1.0
+    uniform = torch.ones_like(concentrated)
+    criterion = SpatialNoiseCrossEntropyLoss(highpass=False)
+
+    concentrated_loss = criterion(concentrated, target, current)
+    uniform_loss = criterion(uniform, target, current)
+    scaled_loss = criterion(concentrated * 17.0, target, current)
+    assert concentrated_loss < uniform_loss
+    torch.testing.assert_close(concentrated_loss, scaled_loss)
+
+
+def test_full_band_energy_detects_pixel_scale_variation() -> None:
+    current = torch.zeros(1, 3, 16, 16)
+    target = torch.zeros(1, 3, 3, 16, 16)
+    yy, xx = torch.meshgrid(torch.arange(16), torch.arange(16), indexing="ij")
+    checkerboard = ((xx + yy).remainder(2) * 2 - 1).float() * 0.2
+    predicted = checkerboard[None, None, None].expand_as(target).clone()
+    loss = FullBandEnergyCorrectionCloudLoss(levels=2)(
+        predicted, target, current
+    )
+    assert loss.item() > 0.0

@@ -113,6 +113,7 @@ class EndpointCorruptionConfig:
 
 @dataclass
 class ModelConfig:
+    architecture: str = "pyramid"
     in_channels: int = 3
     base_channels: int = 32
     heads: int = 8
@@ -129,6 +130,12 @@ class ModelConfig:
     implicit_depth: int = 3
     implicit_fourier_bands: int = 6
     implicit_chunk_size: int = 65536
+    fullres_dim: int = 320
+    fullres_depth: int = 12
+    fullres_cross_depth: int = 2
+    fullres_ffn_ratio: float = 2.0
+    fullres_window_size: int = 8
+    fullres_gradient_checkpointing: bool = True
 
 
 @dataclass
@@ -140,6 +147,9 @@ class LossConfig:
     full_band_charbonnier_epsilon: float = 1e-3
     full_band_high_weight: float = 1.0
     full_band_low_weight: float = 1.0
+    spatial_ce_weight: float = 0.0
+    spatial_ce_highpass: bool = True
+    spatial_ce_kernel_size: int = 5
 
 
 @dataclass
@@ -150,6 +160,8 @@ class TrainConfig:
     grad_clip: float = 1.0
     amp: bool = True
     amp_dtype: str = "float16"
+    amp_init_scale: float = 1024.0
+    amp_growth_interval: int = 2000
     channels_last: bool = True
     tf32: bool = True
     fused_optimizer: bool = True

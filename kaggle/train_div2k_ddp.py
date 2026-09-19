@@ -17,7 +17,11 @@ from torch.utils.data import DataLoader, DistributedSampler
 from tqdm.auto import tqdm
 
 from stochastic_bridge.config import load_config
-from stochastic_bridge.losses import build_cloud_loss
+from stochastic_bridge.losses import (
+    SpatialNoiseCrossEntropyLoss,
+    build_cloud_loss,
+    is_paired_cloud_loss,
+)
 from stochastic_bridge.model import StochasticImageBridge
 from stochastic_bridge.prepared import PreparedBridgeDataset
 
@@ -96,7 +100,6 @@ def move_batch(
         "current",
         "goal",
         "target_cloud",
-        "target_noise",
         "current_level",
         "goal_level",
         "answer_level",
@@ -105,6 +108,8 @@ def move_batch(
         if channels_last and key in {"clean", "current", "goal"}:
             value = value.contiguous(memory_format=torch.channels_last)
         moved[key] = value
+    if "target_noise" in raw:
+        moved["target_noise"] = raw["target_noise"].to(device, non_blocking=True)
     return moved
 
 
@@ -113,6 +118,9 @@ def validate(
     model: nn.Module,
     loader: DataLoader,
     criterion: nn.Module,
+    spatial_criterion: SpatialNoiseCrossEntropyLoss | None,
+    spatial_ce_weight: float,
+    paired: bool,
     device: torch.device,
     samples: int,
     channels_last: bool,
@@ -120,7 +128,7 @@ def validate(
     max_batches: int,
 ) -> dict[str, float]:
     model.eval()
-    totals = torch.zeros(5, device=device)
+    totals = torch.zeros(7, device=device)
     for batch_index, raw in enumerate(loader):
         if max_batches and batch_index >= max_batches:
             break
@@ -134,13 +142,22 @@ def validate(
                 batch["current"],
                 batch["goal"],
                 samples=samples,
-                noise=batch["target_noise"],
+                noise=batch["target_noise"] if paired else None,
                 return_noise_variance=True,
+                return_noise_energy=spatial_criterion is not None,
             )
             if not isinstance(model_output, tuple):
                 raise RuntimeError("model did not return its noise variance")
-            predicted, noise_variance = model_output
-            loss = criterion(predicted, batch["target_cloud"], batch["current"])
+            predicted, noise_variance = model_output[:2]
+            cloud_loss = criterion(
+                predicted, batch["target_cloud"], batch["current"]
+            )
+            spatial_loss = cloud_loss.new_zeros(())
+            if spatial_criterion is not None:
+                spatial_loss = spatial_criterion(
+                    model_output[2], batch["target_cloud"], batch["current"]
+                )
+            loss = cloud_loss + spatial_ce_weight * spatial_loss
         count = batch["clean"].shape[0]
         output_mean = predicted.float().mean(1)
         totals += torch.tensor(
@@ -150,6 +167,8 @@ def validate(
                 psnr(output_mean, batch["clean"].float()).sum().item(),
                 noise_variance.float().sum().item(),
                 count,
+                cloud_loss.float().item() * count,
+                spatial_loss.float().item() * count,
             ],
             device=device,
         )
@@ -160,6 +179,8 @@ def validate(
         "val_current_psnr": totals[1].item() / denominator,
         "val_output_psnr": totals[2].item() / denominator,
         "val_noise_variance": totals[3].item() / denominator,
+        "val_cloud_loss": totals[5].item() / denominator,
+        "val_spatial_ce": totals[6].item() / denominator,
     }
 
 
@@ -217,8 +238,9 @@ def main() -> None:
     val_dataset = PreparedBridgeDataset(
         args.val_prepared, cache_shards=config.data.prepared_cache_shards
     )
+    paired = is_paired_cloud_loss(config.loss.name)
     for dataset in (train_dataset, val_dataset):
-        if not dataset.has_target_noise:
+        if paired and not dataset.has_target_noise:
             raise RuntimeError("Gaussian paired training requires stored target_noise")
         if int(dataset.manifest["target_samples"]) != config.loss.samples:
             raise RuntimeError("prepared target_samples does not match config")
@@ -252,7 +274,11 @@ def main() -> None:
     )
 
     model = StochasticImageBridge(**config.model.__dict__).to(device)
-    channels_last = config.train.channels_last and config.model.encoder_type == "cnn"
+    channels_last = (
+        config.train.channels_last
+        and config.model.architecture == "pyramid"
+        and config.model.encoder_type == "cnn"
+    )
     if channels_last:
         model.to(memory_format=torch.channels_last)
     train_model: nn.Module = model
@@ -277,6 +303,18 @@ def main() -> None:
         full_band_high_weight=config.loss.full_band_high_weight,
         full_band_low_weight=config.loss.full_band_low_weight,
     ).to(device)
+    spatial_criterion = (
+        SpatialNoiseCrossEntropyLoss(
+            highpass=config.loss.spatial_ce_highpass,
+            kernel_size=config.loss.spatial_ce_kernel_size,
+        ).to(device)
+        if config.loss.spatial_ce_weight > 0.0
+        else None
+    )
+    if spatial_criterion is not None and config.model.architecture != "fullres_axial":
+        raise ValueError(
+            "loss.spatial_ce_weight requires model.architecture=fullres_axial"
+        )
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config.train.learning_rate,
@@ -287,7 +325,12 @@ def main() -> None:
         optimizer, T_max=max(config.train.epochs, 1)
     )
     amp_enabled = config.train.amp and device.type == "cuda"
-    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
+    scaler = torch.amp.GradScaler(
+        "cuda",
+        enabled=amp_enabled,
+        init_scale=config.train.amp_init_scale,
+        growth_interval=config.train.amp_growth_interval,
+    )
     history: list[dict[str, float]] = []
     start_epoch = 0
     best_val = math.inf
@@ -312,7 +355,7 @@ def main() -> None:
     for epoch in range(start_epoch, config.train.epochs):
         train_sampler.set_epoch(epoch)
         train_model.train()
-        totals = torch.zeros(5, device=device)
+        totals = torch.zeros(7, device=device)
         progress = tqdm(
             train_loader,
             desc=f"epoch {epoch + 1}/{config.train.epochs}",
@@ -332,15 +375,22 @@ def main() -> None:
                     batch["current"],
                     batch["goal"],
                     samples=config.loss.samples,
-                    noise=batch["target_noise"],
+                    noise=batch["target_noise"] if paired else None,
                     return_noise_variance=True,
+                    return_noise_energy=spatial_criterion is not None,
                 )
                 if not isinstance(model_output, tuple):
                     raise RuntimeError("model did not return its noise variance")
-                predicted, noise_variance = model_output
-                loss = criterion(
+                predicted, noise_variance = model_output[:2]
+                cloud_loss = criterion(
                     predicted, batch["target_cloud"], batch["current"]
                 )
+                spatial_loss = cloud_loss.new_zeros(())
+                if spatial_criterion is not None:
+                    spatial_loss = spatial_criterion(
+                        model_output[2], batch["target_cloud"], batch["current"]
+                    )
+                loss = cloud_loss + config.loss.spatial_ce_weight * spatial_loss
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -359,6 +409,8 @@ def main() -> None:
                     grad_norm.detach().float(),
                     noise_variance.detach().float().sum(),
                     torch.tensor(float(count), device=device),
+                    cloud_loss.detach().float() * count,
+                    spatial_loss.detach().float() * count,
                 ]
             )
             if is_main and (batch_index + 1) % config.train.log_every == 0:
@@ -372,6 +424,8 @@ def main() -> None:
             "train_output_psnr": totals[1].item() / count,
             "gradient_norm": totals[2].item() / max(len(train_loader) * world_size, 1),
             "train_noise_variance": totals[3].item() / count,
+            "train_cloud_loss": totals[5].item() / count,
+            "train_spatial_ce": totals[6].item() / count,
             "learning_rate": optimizer.param_groups[0]["lr"],
         }
         # Advance before checkpointing so a resumed run uses the exact next-
@@ -387,6 +441,9 @@ def main() -> None:
                     model,
                     val_loader,
                     criterion,
+                    spatial_criterion,
+                    config.loss.spatial_ce_weight,
+                    paired,
                     device,
                     config.loss.samples,
                     channels_last,

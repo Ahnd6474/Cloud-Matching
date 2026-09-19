@@ -345,6 +345,37 @@ The legacy `conv` decoder instead injects projected latent noise at the
 bottleneck and all three upsampling scales, using current-image pyramid skips
 and transposed-convolution decoder stages. It remains available for ablations.
 
+### Full-resolution axial/local transformer
+
+`model.architecture: fullres_axial` selects the bottleneck-free experimental
+path in `configs/kaggle_div2k_fullres_axial.yaml`. Current and dream-goal RGB
+pixels are embedded as one token per pixel; there is no patchification or
+spatial downsampling. One or more cross-fusion blocks combine local-window,
+row-axial, and column-axial cross attention. The fused grid predicts a positive
+noise-energy map `w[B,H,W]`, and each implicit cloud member uses
+
+```math
+e_{m,i}=\sqrt{w_i/D}\,\epsilon_{m,i},\qquad
+\epsilon_{m,i}\sim\mathcal N(0,I_D).
+```
+
+After injection, blocks follow the repeating pattern `local -> row -> local ->
+column`. Local blocks alternate ordinary and shifted non-wrapping windows;
+two consecutive axial directions provide global image connectivity without the
+quadratic cost of full spatial attention. A normalized linear head directly
+returns one RGB residual per pixel. Unlike the pyramid path, arbitrary spatial
+sizes are supported and no convolution, transposed convolution, LIIF query, or
+patch unprojection is used.
+
+The unnormalized `w` is retained for sampling. Its normalized form
+`p_i=w_i/sum(w)` is optionally trained with `loss.spatial_ce_weight` against the
+high-frequency correction-energy distribution derived from the target cloud.
+This CE term teaches only *where* to sample: multiplying all `w` values by a
+constant leaves it unchanged. Absolute strength and decoded appearance remain
+self-supervised by Energy distance. The supplied full-resolution Kaggle config
+uses a 13.17M-parameter, width-320, depth-12 model with activation
+checkpointing.
+
 ### 5. Residual update and recurrence
 
 Both decoders end with a bounded residual and a learned per-pixel/channel gate:
@@ -373,6 +404,8 @@ Change `loss.name` in `configs/train.yaml`:
   complete stride-free a-trous frequency pyramid. Unlike pooled features, it
   retains full-resolution checkerboard, edge, and texture errors.
 - `energy`: unpaired energy distance; current default.
+- `energy_full_band`: unpaired energy distance over a Laplacian pyramid that
+  retains pixel-scale edges and texture instead of only pooled low frequencies.
 - `sinkhorn`: debiased Sinkhorn divergence from GeomLoss.
 
 All losses operate on multi-scale **correction features** rather than raw
@@ -382,12 +415,31 @@ Select the shared encoder in the same config:
 
 ```yaml
 model:
+  architecture: pyramid  # pyramid or fullres_axial
   encoder_type: vit  # cnn or vit
   decoder_type: implicit  # conv or implicit
   vit_depth: 4
   vit_patch_size: 8
   implicit_hidden_dim: 128
   implicit_depth: 3
+```
+
+The bottleneck-free experiment instead uses:
+
+```yaml
+model:
+  architecture: fullres_axial
+  heads: 8
+  fullres_dim: 320
+  fullres_depth: 12
+  fullres_cross_depth: 2
+  fullres_ffn_ratio: 2.0
+  fullres_window_size: 8
+  fullres_gradient_checkpointing: true
+loss:
+  name: energy_full_band
+  samples: 4
+  spatial_ce_weight: 0.05
 ```
 
 The ViT path creates tokens directly with an 8x8 patch embedding, applies

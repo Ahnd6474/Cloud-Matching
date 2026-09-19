@@ -1,0 +1,107 @@
+data:
+  root: ""
+  prepared_root: ""
+  prepared_cache_shards: 2
+  synthetic: false
+  synthetic_length: 32
+  image_size: 128
+  # Full-resolution stochastic transformer blocks are substantially more
+  # expensive than the old 1/8 pyramid. Use DDP plus accumulation if needed.
+  batch_size: 1
+  workers: 2
+  prefetch_factor: 2
+  random_crop: true
+  crop_mode: native
+  horizontal_flip: true
+
+prepare:
+  variants_per_image: 32
+  shard_size: 32
+  batch_size: 4
+  workers: 2
+  seed: 17
+
+schedule:
+  steps: 100
+  beta_start: 0.0001
+  beta_end: 0.02
+  answer_jump: 10
+  clean_answer_probability: 0.60
+
+# The explicit teacher is a mixture of Gaussian families. The student remains
+# an implicit sampler and is never asked to classify the selected component.
+corruption:
+  enabled: true
+  spatial_floor: 0.08
+  student_t_df: 3.0
+  weights:
+    white_gaussian: 8
+    local_gaussian: 6
+    edge_gaussian: 6
+    low_frequency_gaussian: 2
+    high_frequency_gaussian: 4
+    band_pass_gaussian: 2
+    channel_correlated_gaussian: 2
+    low_rank_gaussian: 2
+    anisotropic_gaussian: 2
+    signal_dependent_gaussian: 2
+
+endpoint_corruption:
+  enabled: false
+  probability: 0.0
+
+# The goal is deliberately dream-like: it carries layout and semantics but
+# cannot leak the sharp target texture into the pixel-token transformer.
+goal_corruption:
+  enabled: true
+  blur_probability: 1.0
+  downsample_probability: 1.0
+  mask_probability: 0.15
+  minimum_scale: 0.20
+  maximum_mask_fraction: 0.20
+
+model:
+  architecture: fullres_axial
+  in_channels: 3
+  heads: 8
+  max_residual: 1.0
+  noise_variance_min: 0.0001
+  noise_variance_max: 2.0
+  noise_variance_init: 0.1
+  fullres_dim: 320
+  fullres_depth: 12
+  fullres_cross_depth: 2
+  fullres_ffn_ratio: 2.0
+  fullres_window_size: 8
+  fullres_gradient_checkpointing: true
+
+loss:
+  name: energy_full_band
+  samples: 4
+  full_band_levels: 3
+  # CE learns only the normalized spatial sampling policy. Absolute sampling
+  # strength remains unsupervised and is learned through energy distance.
+  spatial_ce_weight: 0.05
+  spatial_ce_highpass: true
+  spatial_ce_kernel_size: 5
+
+train:
+  epochs: 100
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  amp: true
+  amp_dtype: float16
+  amp_init_scale: 1024.0
+  amp_growth_interval: 2000
+  channels_last: false
+  tf32: true
+  fused_optimizer: true
+  compile: false
+  compile_mode: reduce-overhead
+  seed: 17
+  log_every: 20
+  preview_every: 200
+  save_every: 1000
+  output_dir: "/kaggle/working/cloud_matching_div2k_fullres_axial"
+  resume: ""

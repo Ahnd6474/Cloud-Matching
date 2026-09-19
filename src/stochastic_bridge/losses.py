@@ -27,6 +27,33 @@ class MultiScaleCorrectionFeatures(nn.Module):
         return torch.cat(features, dim=1)
 
 
+class LaplacianCorrectionFeatures(nn.Module):
+    """Full-band Laplacian-pyramid features with bounded total dimensionality."""
+
+    def __init__(self, levels: int = 3) -> None:
+        super().__init__()
+        if levels < 1:
+            raise ValueError("Laplacian features require at least one level")
+        self.levels = levels
+
+    def forward(self, images: Tensor) -> Tensor:
+        features: list[Tensor] = []
+        current = images
+        for _ in range(self.levels):
+            if min(current.shape[-2:]) < 2:
+                break
+            low = F.avg_pool2d(current, kernel_size=2, stride=2)
+            reconstructed = F.interpolate(
+                low, size=current.shape[-2:], mode="bilinear", align_corners=False
+            )
+            band = (current - reconstructed).flatten(1)
+            features.append(band / math.sqrt(band.shape[1]))
+            current = low
+        low = current.flatten(1)
+        features.append(low / math.sqrt(low.shape[1]))
+        return torch.cat(features, dim=1)
+
+
 class SinkhornCorrectionCloudLoss(nn.Module):
     """Sinkhorn divergence between predicted and target correction clouds."""
 
@@ -198,6 +225,94 @@ class EnergyCorrectionCloudLoss(nn.Module):
         return (2.0 * cross - predicted_self - target_self).mean()
 
 
+class FullBandEnergyCorrectionCloudLoss(EnergyCorrectionCloudLoss):
+    """Energy distance that preserves pixel-scale detail via a Laplacian pyramid."""
+
+    def __init__(self, levels: int = 3) -> None:
+        super().__init__(feature_extractor=LaplacianCorrectionFeatures(levels))
+
+
+class SpatialNoiseCrossEntropyLoss(nn.Module):
+    """Teach the sampler where target-cloud correction energy is concentrated.
+
+    The predicted map remains unnormalized for sampling, so the cloud loss is
+    free to learn its absolute scale.  Cross entropy sees only the normalized
+    spatial allocation and therefore cannot impose a separate strength label.
+    """
+
+    def __init__(
+        self,
+        highpass: bool = True,
+        kernel_size: int = 5,
+        epsilon: float = 1e-8,
+    ) -> None:
+        super().__init__()
+        if kernel_size < 1 or kernel_size % 2 == 0:
+            raise ValueError("spatial CE kernel size must be a positive odd integer")
+        if epsilon <= 0.0:
+            raise ValueError("spatial CE epsilon must be positive")
+        self.highpass = highpass
+        self.kernel_size = kernel_size
+        self.epsilon = epsilon
+
+    def forward(
+        self,
+        predicted_energy: Tensor,
+        target_cloud: Tensor,
+        current: Tensor,
+    ) -> Tensor:
+        if predicted_energy.ndim == 4 and predicted_energy.shape[1] == 1:
+            predicted_energy = predicted_energy[:, 0]
+        if predicted_energy.ndim != 3:
+            raise ValueError("predicted energy must have shape [B,H,W]")
+        if target_cloud.ndim != 5:
+            raise ValueError("target cloud must have shape [B,S,C,H,W]")
+        if current.shape != target_cloud[:, 0].shape:
+            raise ValueError("current must have shape [B,C,H,W]")
+        if predicted_energy.shape != (
+            current.shape[0],
+            current.shape[2],
+            current.shape[3],
+        ):
+            raise ValueError("predicted energy spatial shape must match current")
+
+        correction = target_cloud - current[:, None]
+        if self.highpass and self.kernel_size > 1:
+            flat = correction.flatten(0, 1)
+            smooth = F.avg_pool2d(
+                flat,
+                self.kernel_size,
+                stride=1,
+                padding=self.kernel_size // 2,
+            )
+            correction = (flat - smooth).reshape_as(correction)
+        target_energy = correction.float().square().mean(dim=(1, 2))
+        target_total = target_energy.sum(dim=(-2, -1), keepdim=True)
+        valid = target_total.flatten() > self.epsilon
+        if not torch.any(valid):
+            return predicted_energy.sum() * 0.0
+
+        target_probability = target_energy[valid] / target_total[valid].clamp_min(
+            self.epsilon
+        )
+        predicted = predicted_energy[valid].float().clamp_min(self.epsilon)
+        predicted_probability = predicted / predicted.sum(
+            dim=(-2, -1), keepdim=True
+        ).clamp_min(self.epsilon)
+        cross_entropy = -(
+            target_probability
+            * predicted_probability.clamp_min(self.epsilon).log()
+        ).sum(dim=(-2, -1)).mean()
+        # Subtract the target entropy. This is KL(q || p), which has exactly
+        # the same gradient as CE(q, p) but removes the resolution-dependent
+        # constant (log(HW) for a uniform target) from training curves.
+        target_entropy = -(
+            target_probability
+            * target_probability.clamp_min(self.epsilon).log()
+        ).sum(dim=(-2, -1)).mean()
+        return cross_entropy - target_entropy
+
+
 def _cloud_features(features: nn.Module, cloud: Tensor) -> Tensor:
     if cloud.ndim != 5:
         raise ValueError("cloud must have shape [B, samples, C, H, W]")
@@ -230,8 +345,11 @@ def build_cloud_loss(
         )
     if normalized == "energy":
         return EnergyCorrectionCloudLoss()
+    if normalized == "energy_full_band":
+        return FullBandEnergyCorrectionCloudLoss(levels=full_band_levels)
     if normalized == "sinkhorn":
         return SinkhornCorrectionCloudLoss(blur=blur)
     raise ValueError(
-        f"unknown loss '{name}'; choose paired, paired_full_band, energy, or sinkhorn"
+        f"unknown loss '{name}'; choose paired, paired_full_band, energy, "
+        "energy_full_band, or sinkhorn"
     )

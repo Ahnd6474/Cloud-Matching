@@ -5,6 +5,7 @@ import math
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 
 
 def _group_count(channels: int) -> int:
@@ -303,11 +304,381 @@ def _fourier_coordinate_grid(
     return encoded.permute(2, 0, 1)[None].to(dtype=dtype)
 
 
+def _partition_windows(
+    tokens: Tensor,
+    window_size: int,
+    shift: int,
+) -> tuple[Tensor, Tensor, tuple[int, int, int, int, int]]:
+    """Partition a channels-last image without cyclic boundary wrapping."""
+    batch, height, width, dim = tokens.shape
+    top = shift
+    left = shift
+    padded_height = math.ceil((height + top) / window_size) * window_size
+    padded_width = math.ceil((width + left) / window_size) * window_size
+    bottom = padded_height - height - top
+    right = padded_width - width - left
+    channels_first = tokens.permute(0, 3, 1, 2)
+    padded = F.pad(channels_first, (left, right, top, bottom))
+    padded = padded.permute(0, 2, 3, 1)
+    windows = (
+        padded.reshape(
+            batch,
+            padded_height // window_size,
+            window_size,
+            padded_width // window_size,
+            window_size,
+            dim,
+        )
+        .permute(0, 1, 3, 2, 4, 5)
+        .reshape(-1, window_size * window_size, dim)
+    )
+
+    valid = torch.ones(
+        (batch, 1, height, width), device=tokens.device, dtype=torch.bool
+    )
+    valid = F.pad(valid, (left, right, top, bottom), value=False)
+    valid_windows = (
+        valid.reshape(
+            batch,
+            1,
+            padded_height // window_size,
+            window_size,
+            padded_width // window_size,
+            window_size,
+        )
+        .permute(0, 2, 4, 3, 5, 1)
+        .reshape(-1, window_size * window_size)
+    )
+    metadata = (height, width, padded_height, padded_width, shift)
+    return windows, ~valid_windows, metadata
+
+
+def _reverse_windows(
+    windows: Tensor,
+    window_size: int,
+    metadata: tuple[int, int, int, int, int],
+    batch: int,
+) -> Tensor:
+    height, width, padded_height, padded_width, shift = metadata
+    dim = windows.shape[-1]
+    padded = (
+        windows.reshape(
+            batch,
+            padded_height // window_size,
+            padded_width // window_size,
+            window_size,
+            window_size,
+            dim,
+        )
+        .permute(0, 1, 3, 2, 4, 5)
+        .reshape(batch, padded_height, padded_width, dim)
+    )
+    return padded[:, shift : shift + height, shift : shift + width]
+
+
+class FactorizedAttention2d(nn.Module):
+    """Local-window or axial attention over a full-resolution token grid."""
+
+    def __init__(
+        self,
+        dim: int,
+        heads: int,
+        kind: str,
+        window_size: int = 8,
+        shift: bool = False,
+    ) -> None:
+        super().__init__()
+        if kind not in {"local", "row", "column"}:
+            raise ValueError("attention kind must be local, row, or column")
+        if window_size < 1:
+            raise ValueError("fullres_window_size must be positive")
+        self.kind = kind
+        self.window_size = window_size
+        self.shift = window_size // 2 if shift and window_size > 1 else 0
+        self.attention = nn.MultiheadAttention(dim, heads, batch_first=True)
+
+    def forward(self, query: Tensor, context: Tensor | None = None) -> Tensor:
+        context = query if context is None else context
+        if query.shape != context.shape or query.ndim != 4:
+            raise ValueError("attention tensors must share [B,H,W,D] shape")
+        batch, height, width, dim = query.shape
+        if self.kind == "row":
+            q = query.reshape(batch * height, width, dim)
+            kv = context.reshape(batch * height, width, dim)
+            result, _ = self.attention(q, kv, kv, need_weights=False)
+            return result.reshape(batch, height, width, dim)
+        if self.kind == "column":
+            q = query.permute(0, 2, 1, 3).reshape(batch * width, height, dim)
+            kv = context.permute(0, 2, 1, 3).reshape(batch * width, height, dim)
+            result, _ = self.attention(q, kv, kv, need_weights=False)
+            return result.reshape(batch, width, height, dim).permute(0, 2, 1, 3)
+
+        q_windows, padding_mask, metadata = _partition_windows(
+            query, self.window_size, self.shift
+        )
+        kv_windows, _, context_metadata = _partition_windows(
+            context, self.window_size, self.shift
+        )
+        if metadata != context_metadata:
+            raise RuntimeError("query and context window layouts differ")
+        result, _ = self.attention(
+            q_windows,
+            kv_windows,
+            kv_windows,
+            key_padding_mask=padding_mask,
+            need_weights=False,
+        )
+        return _reverse_windows(result, self.window_size, metadata, batch)
+
+
+class FullResolutionCrossBlock(nn.Module):
+    """Fuse current and dream-goal pixels with local and axial cross attention."""
+
+    def __init__(
+        self,
+        dim: int,
+        heads: int,
+        window_size: int,
+        ffn_ratio: float,
+        shifted: bool,
+    ) -> None:
+        super().__init__()
+        hidden = max(dim, round(dim * ffn_ratio))
+        self.query_norms = nn.ModuleList([nn.LayerNorm(dim) for _ in range(3)])
+        self.context_norms = nn.ModuleList([nn.LayerNorm(dim) for _ in range(3)])
+        self.attentions = nn.ModuleList(
+            [
+                FactorizedAttention2d(
+                    dim, heads, "local", window_size=window_size, shift=shifted
+                ),
+                FactorizedAttention2d(dim, heads, "row"),
+                FactorizedAttention2d(dim, heads, "column"),
+            ]
+        )
+        self.ff = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, dim),
+        )
+
+    def forward(self, current: Tensor, goal: Tensor) -> Tensor:
+        for query_norm, context_norm, attention in zip(
+            self.query_norms,
+            self.context_norms,
+            self.attentions,
+            strict=True,
+        ):
+            current = current + attention(query_norm(current), context_norm(goal))
+        return current + self.ff(current)
+
+
+class FullResolutionMixerBlock(nn.Module):
+    """One local, row-axial, or column-axial transformer block."""
+
+    def __init__(
+        self,
+        dim: int,
+        heads: int,
+        kind: str,
+        window_size: int,
+        ffn_ratio: float,
+        shifted: bool,
+    ) -> None:
+        super().__init__()
+        hidden = max(dim, round(dim * ffn_ratio))
+        self.norm = nn.LayerNorm(dim)
+        self.attention = FactorizedAttention2d(
+            dim,
+            heads,
+            kind,
+            window_size=window_size,
+            shift=shifted,
+        )
+        self.ff = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, dim),
+        )
+
+    def forward(self, tokens: Tensor) -> Tensor:
+        tokens = tokens + self.attention(self.norm(tokens))
+        return tokens + self.ff(tokens)
+
+
+class FullResolutionAxialCore(nn.Module):
+    """Pixel-token bridge with dense cross fusion and factorized self attention."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        dim: int,
+        heads: int,
+        depth: int,
+        cross_depth: int,
+        ffn_ratio: float,
+        window_size: int,
+        max_residual: float,
+        noise_energy_min: float,
+        noise_energy_max: float,
+        noise_energy_init: float,
+        gradient_checkpointing: bool,
+    ) -> None:
+        super().__init__()
+        if dim % heads:
+            raise ValueError("fullres_dim must be divisible by heads")
+        if dim % 4:
+            raise ValueError("fullres_dim must be divisible by 4")
+        if depth < 1 or cross_depth < 1:
+            raise ValueError("full-resolution depths must be positive")
+        if ffn_ratio <= 0.0:
+            raise ValueError("fullres_ffn_ratio must be positive")
+        self.in_channels = in_channels
+        self.dim = dim
+        self.max_residual = max_residual
+        self.noise_energy_min = noise_energy_min
+        self.noise_energy_max = noise_energy_max
+        self.gradient_checkpointing = gradient_checkpointing
+        self.pixel_embed = nn.Linear(in_channels, dim)
+        self.cross_blocks = nn.ModuleList(
+            [
+                FullResolutionCrossBlock(
+                    dim,
+                    heads,
+                    window_size,
+                    ffn_ratio,
+                    shifted=bool(index % 2),
+                )
+                for index in range(cross_depth)
+            ]
+        )
+        pattern = ("local", "row", "local", "column")
+        self.blocks = nn.ModuleList(
+            [
+                FullResolutionMixerBlock(
+                    dim,
+                    heads,
+                    pattern[index % len(pattern)],
+                    window_size,
+                    ffn_ratio,
+                    shifted=(pattern[index % len(pattern)] == "local" and index % 4 == 2),
+                )
+                for index in range(depth)
+            ]
+        )
+        self.energy_norm = nn.LayerNorm(dim)
+        self.energy_head = nn.Linear(dim, 1)
+        fraction = (noise_energy_init - noise_energy_min) / (
+            noise_energy_max - noise_energy_min
+        )
+        energy_bias = math.log(fraction / (1.0 - fraction))
+        nn.init.zeros_(self.energy_head.weight)
+        nn.init.constant_(self.energy_head.bias, energy_bias)
+        projection = torch.randn(dim, in_channels)
+        projection = projection / projection.norm(dim=1, keepdim=True).clamp_min(1e-8)
+        self.register_buffer("rgb_noise_projection", projection)
+        self.output_norm = nn.LayerNorm(dim)
+        self.output_head = nn.Linear(dim, in_channels)
+        nn.init.normal_(self.output_head.weight, std=1e-3)
+        nn.init.zeros_(self.output_head.bias)
+
+    def encode_condition(self, current: Tensor, goal: Tensor) -> Tensor:
+        batch, _, height, width = current.shape
+        current_tokens = self.pixel_embed(current.permute(0, 2, 3, 1))
+        goal_tokens = self.pixel_embed(goal.permute(0, 2, 3, 1))
+        position = _sinusoidal_2d_position(
+            height, width, self.dim, current.device, current.dtype
+        ).reshape(1, height, width, self.dim)
+        current_tokens = current_tokens + position
+        goal_tokens = goal_tokens + position
+        for block in self.cross_blocks:
+            if self.gradient_checkpointing and self.training:
+                current_tokens = checkpoint(
+                    block, current_tokens, goal_tokens, use_reentrant=False
+                )
+            else:
+                current_tokens = block(current_tokens, goal_tokens)
+        if current_tokens.shape != (batch, height, width, self.dim):
+            raise RuntimeError("full-resolution condition changed spatial shape")
+        return current_tokens
+
+    def spatial_energy(self, condition: Tensor) -> Tensor:
+        unit_energy = torch.sigmoid(self.energy_head(self.energy_norm(condition)))
+        energy = self.noise_energy_min + (
+            self.noise_energy_max - self.noise_energy_min
+        ) * unit_energy
+        return energy.squeeze(-1)
+
+    def _latent_noise(
+        self,
+        condition: Tensor,
+        samples: int,
+        noise: Tensor | None,
+    ) -> Tensor:
+        batch, height, width, dim = condition.shape
+        if noise is None:
+            return torch.randn(
+                batch,
+                samples,
+                height,
+                width,
+                dim,
+                device=condition.device,
+                dtype=condition.dtype,
+            )
+        if noise.ndim != 5 or noise.shape[:2] != (batch, samples):
+            raise ValueError("noise must have shape [B,samples,C,H,W]")
+        if noise.shape[-2:] != (height, width):
+            raise ValueError("noise spatial shape must match the input images")
+        channels = noise.shape[2]
+        channels_last = noise.permute(0, 1, 3, 4, 2)
+        if channels == dim:
+            return channels_last
+        if channels == self.in_channels:
+            return F.linear(channels_last, self.rgb_noise_projection)
+        raise ValueError(
+            f"noise channels must be {self.in_channels} or {dim}, got {channels}"
+        )
+
+    def decode(
+        self,
+        condition: Tensor,
+        current: Tensor,
+        samples: int,
+        noise: Tensor | None,
+    ) -> tuple[Tensor, Tensor]:
+        batch, height, width, dim = condition.shape
+        energy = self.spatial_energy(condition)
+        latent = self._latent_noise(condition, samples, noise)
+        # ``energy`` is total expected feature-vector energy at a pixel.
+        latent = latent * (energy / dim).sqrt()[:, None, :, :, None]
+        tokens = condition[:, None].expand(-1, samples, -1, -1, -1) + latent
+        tokens = tokens.reshape(batch * samples, height, width, dim)
+        for block in self.blocks:
+            if self.gradient_checkpointing and self.training:
+                tokens = checkpoint(block, tokens, use_reentrant=False)
+            else:
+                tokens = block(tokens)
+        residual = self.max_residual * torch.tanh(
+            self.output_head(self.output_norm(tokens))
+        )
+        residual = residual.permute(0, 3, 1, 2)
+        flat_current = (
+            current[:, None]
+            .expand(-1, samples, -1, -1, -1)
+            .reshape(batch * samples, *current.shape[1:])
+        )
+        cloud = (flat_current + residual).clamp(-1.0, 1.0)
+        return cloud.reshape(batch, samples, *current.shape[1:]), energy
+
+
 class StochasticImageBridge(nn.Module):
     """Shared encoder, cross-attention, spatial noise, and residual decoder."""
 
     def __init__(
         self,
+        architecture: str = "pyramid",
         in_channels: int = 3,
         base_channels: int = 32,
         heads: int = 8,
@@ -324,6 +695,12 @@ class StochasticImageBridge(nn.Module):
         implicit_depth: int = 3,
         implicit_fourier_bands: int = 6,
         implicit_chunk_size: int = 65_536,
+        fullres_dim: int = 320,
+        fullres_depth: int = 12,
+        fullres_cross_depth: int = 2,
+        fullres_ffn_ratio: float = 2.0,
+        fullres_window_size: int = 8,
+        fullres_gradient_checkpointing: bool = True,
         image_size: int | None = None,
         **legacy: object,
     ) -> None:
@@ -336,10 +713,13 @@ class StochasticImageBridge(nn.Module):
         if legacy:
             raise TypeError(f"unexpected model arguments: {sorted(legacy)}")
 
+        normalized_architecture = architecture.strip().lower()
+        if normalized_architecture not in {"pyramid", "fullres_axial"}:
+            raise ValueError("architecture must be 'pyramid' or 'fullres_axial'")
         bottleneck_channels = base_channels * 8
-        if bottleneck_channels % heads:
+        if normalized_architecture == "pyramid" and bottleneck_channels % heads:
             raise ValueError("base_channels * 8 must be divisible by heads")
-        if bottleneck_channels % 4:
+        if normalized_architecture == "pyramid" and bottleneck_channels % 4:
             raise ValueError("base_channels * 8 must be divisible by 4")
         if not 0.0 <= noise_variance_min < noise_variance_max:
             raise ValueError("noise_variance_min must be non-negative and below max")
@@ -351,6 +731,25 @@ class StochasticImageBridge(nn.Module):
         self.max_residual = max_residual
         self.noise_variance_min = noise_variance_min
         self.noise_variance_max = noise_variance_max
+        self.architecture = normalized_architecture
+        if self.architecture == "fullres_axial":
+            self.fullres = FullResolutionAxialCore(
+                in_channels=in_channels,
+                dim=fullres_dim,
+                heads=heads,
+                depth=fullres_depth,
+                cross_depth=fullres_cross_depth,
+                ffn_ratio=fullres_ffn_ratio,
+                window_size=fullres_window_size,
+                max_residual=max_residual,
+                noise_energy_min=noise_variance_min,
+                noise_energy_max=noise_variance_max,
+                noise_energy_init=noise_variance_init,
+                gradient_checkpointing=fullres_gradient_checkpointing,
+            )
+            self.encoder_type = "fullres_axial"
+            self.decoder_type = "linear_pixel"
+            return
         normalized_encoder = encoder_type.strip().lower()
         if normalized_encoder == "cnn":
             self.encoder: nn.Module = SharedPyramidEncoder(in_channels, base_channels)
@@ -423,6 +822,9 @@ class StochasticImageBridge(nn.Module):
     def encode_condition(self, current: Tensor, goal: Tensor) -> tuple[Tensor, list[Tensor]]:
         """Compute deterministic context once before drawing cloud samples."""
         self._validate_images(current, goal)
+        if self.architecture == "fullres_axial":
+            condition = self.fullres.encode_condition(current, goal)
+            return condition.permute(0, 3, 1, 2), []
         # One larger shared-encoder call has better accelerator utilization and
         # fewer kernel launches than two independent calls with identical weights.
         batch = current.shape[0]
@@ -452,6 +854,11 @@ class StochasticImageBridge(nn.Module):
         """Predict one conditional latent variance per input image."""
         if fused.ndim != 4:
             raise ValueError("fused condition must have shape [B,C,H,W]")
+        if self.architecture == "fullres_axial":
+            condition = fused.permute(0, 2, 3, 1)
+            return self.fullres.spatial_energy(condition).mean(
+                dim=(-2, -1), keepdim=False
+            )[:, None]
         pooled = fused.mean(dim=(-2, -1))
         unit_variance = torch.sigmoid(self.noise_variance_head(pooled))
         return self.noise_variance_min + (
@@ -463,6 +870,19 @@ class StochasticImageBridge(nn.Module):
         fused, _ = self.encode_condition(current, goal)
         return self.noise_variance_from_condition(fused).squeeze(-1)
 
+    def noise_energy_from_condition(self, fused: Tensor) -> Tensor:
+        """Return the learned full-resolution noise-energy map [B,H,W]."""
+        if self.architecture != "fullres_axial":
+            raise RuntimeError("spatial noise energy is available only for fullres_axial")
+        if fused.ndim != 4:
+            raise ValueError("fused condition must have shape [B,C,H,W]")
+        return self.fullres.spatial_energy(fused.permute(0, 2, 3, 1))
+
+    def predict_noise_energy(self, current: Tensor, goal: Tensor) -> Tensor:
+        """Encode current/goal and return spatial noise energy [B,H,W]."""
+        fused, _ = self.encode_condition(current, goal)
+        return self.noise_energy_from_condition(fused)
+
     def forward(
         self,
         current: Tensor,
@@ -470,12 +890,29 @@ class StochasticImageBridge(nn.Module):
         samples: int = 4,
         noise: Tensor | None = None,
         return_noise_variance: bool = False,
-    ) -> Tensor | tuple[Tensor, Tensor]:
+        return_noise_energy: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor] | tuple[Tensor, Tensor, Tensor]:
         fused, current_skips = self.encode_condition(current, goal)
-        noise_variance = self.noise_variance_from_condition(fused)
-        batch, _, height, width = current.shape
         if samples < 1:
             raise ValueError("samples must be positive")
+        if self.architecture == "fullres_axial":
+            condition = fused.permute(0, 2, 3, 1)
+            cloud, spatial_energy = self.fullres.decode(
+                condition=condition,
+                current=current,
+                samples=samples,
+                noise=noise,
+            )
+            noise_variance = spatial_energy.mean(dim=(-2, -1))
+            if return_noise_energy:
+                return cloud, noise_variance, spatial_energy
+            if return_noise_variance:
+                return cloud, noise_variance
+            return cloud
+        noise_variance = self.noise_variance_from_condition(fused)
+        batch, _, height, width = current.shape
+        if return_noise_energy:
+            raise RuntimeError("spatial noise energy is available only for fullres_axial")
         if noise is None:
             noise = torch.randn(
                 batch,
@@ -547,5 +984,7 @@ class StochasticImageBridge(nn.Module):
             raise ValueError("current and goal must have identical [B,C,H,W] shapes")
         if current.shape[1] != self.in_channels:
             raise ValueError(f"expected {self.in_channels} image channels")
-        if current.shape[-2] % 8 or current.shape[-1] % 8:
+        if self.architecture == "pyramid" and (
+            current.shape[-2] % 8 or current.shape[-1] % 8
+        ):
             raise ValueError("image height and width must be divisible by 8")

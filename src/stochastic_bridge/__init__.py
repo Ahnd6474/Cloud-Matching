@@ -1,8 +1,10 @@
 from .data import BridgeBatch, build_bridge_batch, sample_level_triplet
 from .losses import (
     EnergyCorrectionCloudLoss,
+    FullBandEnergyCorrectionCloudLoss,
     PairedFullBandCloudLoss,
     PairedCorrectionLoss,
+    SpatialNoiseCrossEntropyLoss,
     SinkhornCorrectionCloudLoss,
     build_cloud_loss,
     is_paired_cloud_loss,
@@ -15,8 +17,10 @@ from .schedule import VPNoiseSchedule
 __all__ = [
     "BridgeBatch",
     "EnergyCorrectionCloudLoss",
+    "FullBandEnergyCorrectionCloudLoss",
     "PairedFullBandCloudLoss",
     "PairedCorrectionLoss",
+    "SpatialNoiseCrossEntropyLoss",
     "SinkhornCorrectionCloudLoss",
     "StochasticImageBridge",
     "CorruptionMixture",

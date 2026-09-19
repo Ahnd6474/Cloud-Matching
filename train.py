@@ -43,6 +43,11 @@ def main() -> None:
         config.model.base_channels = 8
         config.model.heads = 4
         config.model.attention_depth = 1
+        config.model.fullres_dim = 32
+        config.model.fullres_depth = 2
+        config.model.fullres_cross_depth = 1
+        config.model.fullres_window_size = 4
+        config.model.fullres_gradient_checkpointing = False
         config.loss.samples = 2
         config.train.epochs = 1
         config.train.log_every = 1
