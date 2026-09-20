@@ -122,6 +122,8 @@ class ModelConfig:
     noise_variance_min: float = 1e-4
     noise_variance_max: float = 1.0
     noise_variance_init: float = 0.1
+    noise_energy_parameterization: str = "bounded"
+    noise_amplitude_safety_max: float = 8.0
     encoder_type: str = "cnn"
     vit_depth: int = 4
     vit_patch_size: int = 8

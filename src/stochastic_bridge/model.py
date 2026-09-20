@@ -523,6 +523,8 @@ class FullResolutionAxialCore(nn.Module):
         noise_energy_min: float,
         noise_energy_max: float,
         noise_energy_init: float,
+        noise_energy_parameterization: str,
+        noise_amplitude_safety_max: float,
         gradient_checkpointing: bool,
     ) -> None:
         super().__init__()
@@ -539,6 +541,8 @@ class FullResolutionAxialCore(nn.Module):
         self.max_residual = max_residual
         self.noise_energy_min = noise_energy_min
         self.noise_energy_max = noise_energy_max
+        self.noise_energy_parameterization = noise_energy_parameterization
+        self.noise_amplitude_safety_max = noise_amplitude_safety_max
         self.gradient_checkpointing = gradient_checkpointing
         self.pixel_embed = nn.Linear(in_channels, dim)
         self.cross_blocks = nn.ModuleList(
@@ -569,10 +573,16 @@ class FullResolutionAxialCore(nn.Module):
         )
         self.energy_norm = nn.LayerNorm(dim)
         self.energy_head = nn.Linear(dim, 1)
-        fraction = (noise_energy_init - noise_energy_min) / (
-            noise_energy_max - noise_energy_min
-        )
-        energy_bias = math.log(fraction / (1.0 - fraction))
+        if noise_energy_parameterization == "bounded":
+            fraction = (noise_energy_init - noise_energy_min) / (
+                noise_energy_max - noise_energy_min
+            )
+            energy_bias = math.log(fraction / (1.0 - fraction))
+        else:
+            initial_amplitude = math.sqrt(noise_energy_init - noise_energy_min)
+            # Inverse softplus makes the initial total energy exactly
+            # ``noise_energy_init`` while leaving its learned scale unbounded.
+            energy_bias = math.log(math.expm1(initial_amplitude))
         nn.init.zeros_(self.energy_head.weight)
         nn.init.constant_(self.energy_head.bias, energy_bias)
         projection = torch.randn(dim, in_channels)
@@ -604,10 +614,19 @@ class FullResolutionAxialCore(nn.Module):
         return current_tokens
 
     def spatial_energy(self, condition: Tensor) -> Tensor:
-        unit_energy = torch.sigmoid(self.energy_head(self.energy_norm(condition)))
-        energy = self.noise_energy_min + (
-            self.noise_energy_max - self.noise_energy_min
-        ) * unit_energy
+        raw = self.energy_head(self.energy_norm(condition))
+        if self.noise_energy_parameterization == "bounded":
+            unit_energy = torch.sigmoid(raw)
+            energy = self.noise_energy_min + (
+                self.noise_energy_max - self.noise_energy_min
+            ) * unit_energy
+        else:
+            # Learn noise amplitude directly.  The clamp is only a distant
+            # numerical guard for AMP; it is not the trainable operating range.
+            amplitude = F.softplus(raw.float()).clamp_max(
+                self.noise_amplitude_safety_max
+            )
+            energy = (self.noise_energy_min + amplitude.square()).to(raw.dtype)
         return energy.squeeze(-1)
 
     def _latent_noise(
@@ -687,6 +706,8 @@ class StochasticImageBridge(nn.Module):
         noise_variance_min: float = 1e-4,
         noise_variance_max: float = 1.0,
         noise_variance_init: float = 0.1,
+        noise_energy_parameterization: str = "bounded",
+        noise_amplitude_safety_max: float = 8.0,
         encoder_type: str = "cnn",
         vit_depth: int = 4,
         vit_patch_size: int = 8,
@@ -721,16 +742,52 @@ class StochasticImageBridge(nn.Module):
             raise ValueError("base_channels * 8 must be divisible by heads")
         if normalized_architecture == "pyramid" and bottleneck_channels % 4:
             raise ValueError("base_channels * 8 must be divisible by 4")
+        normalized_energy_parameterization = (
+            noise_energy_parameterization.strip().lower()
+        )
+        if normalized_energy_parameterization not in {
+            "bounded",
+            "softplus_amplitude",
+        }:
+            raise ValueError(
+                "noise_energy_parameterization must be 'bounded' or "
+                "'softplus_amplitude'"
+            )
+        if (
+            normalized_architecture != "fullres_axial"
+            and normalized_energy_parameterization != "bounded"
+        ):
+            raise ValueError(
+                "softplus_amplitude noise energy is available only for "
+                "fullres_axial"
+            )
         if not 0.0 <= noise_variance_min < noise_variance_max:
             raise ValueError("noise_variance_min must be non-negative and below max")
-        if not noise_variance_min < noise_variance_init < noise_variance_max:
-            raise ValueError("noise_variance_init must lie strictly between min and max")
+        if noise_variance_init <= noise_variance_min:
+            raise ValueError("noise_variance_init must be strictly above min")
+        if (
+            normalized_energy_parameterization == "bounded"
+            and noise_variance_init >= noise_variance_max
+        ):
+            raise ValueError("bounded noise_variance_init must be strictly below max")
+        if noise_amplitude_safety_max <= 0.0:
+            raise ValueError("noise_amplitude_safety_max must be positive")
+        if (
+            normalized_energy_parameterization == "softplus_amplitude"
+            and noise_variance_init - noise_variance_min
+            >= noise_amplitude_safety_max**2
+        ):
+            raise ValueError(
+                "initial noise energy must be below the amplitude safety limit"
+            )
 
         self.in_channels = in_channels
         self.base_channels = base_channels
         self.max_residual = max_residual
         self.noise_variance_min = noise_variance_min
         self.noise_variance_max = noise_variance_max
+        self.noise_energy_parameterization = normalized_energy_parameterization
+        self.noise_amplitude_safety_max = noise_amplitude_safety_max
         self.architecture = normalized_architecture
         if self.architecture == "fullres_axial":
             self.fullres = FullResolutionAxialCore(
@@ -745,6 +802,8 @@ class StochasticImageBridge(nn.Module):
                 noise_energy_min=noise_variance_min,
                 noise_energy_max=noise_variance_max,
                 noise_energy_init=noise_variance_init,
+                noise_energy_parameterization=normalized_energy_parameterization,
+                noise_amplitude_safety_max=noise_amplitude_safety_max,
                 gradient_checkpointing=fullres_gradient_checkpointing,
             )
             self.encoder_type = "fullres_axial"

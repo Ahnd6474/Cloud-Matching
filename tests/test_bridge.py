@@ -377,6 +377,38 @@ def test_full_resolution_axial_bridge_is_pixel_aligned_and_trainable() -> None:
     )
 
 
+def test_softplus_amplitude_energy_has_no_legacy_sigmoid_ceiling() -> None:
+    model = StochasticImageBridge(
+        architecture="fullres_axial",
+        in_channels=3,
+        heads=4,
+        noise_variance_min=1e-4,
+        noise_variance_max=1.0,
+        noise_variance_init=0.1,
+        noise_energy_parameterization="softplus_amplitude",
+        noise_amplitude_safety_max=8.0,
+        fullres_dim=32,
+        fullres_depth=1,
+        fullres_cross_depth=1,
+        fullres_window_size=4,
+        fullres_gradient_checkpointing=False,
+    )
+    condition = torch.randn(2, 5, 7, 32)
+    initial = model.fullres.spatial_energy(condition)
+    torch.testing.assert_close(initial, torch.full_like(initial, 0.1))
+
+    with torch.no_grad():
+        model.fullres.energy_head.weight.zero_()
+        model.fullres.energy_head.bias.fill_(2.0)
+    energy = model.fullres.spatial_energy(condition)
+    assert energy.min().item() > model.noise_variance_max
+    assert energy.max().item() <= 8.0**2 + model.noise_variance_min
+
+    energy.mean().backward()
+    assert model.fullres.energy_head.bias.grad is not None
+    assert model.fullres.energy_head.bias.grad.abs().item() > 0.0
+
+
 def test_spatial_noise_ce_teaches_relative_location_not_strength() -> None:
     current = torch.zeros(1, 3, 8, 8)
     target = current[:, None].repeat(1, 2, 1, 1, 1)

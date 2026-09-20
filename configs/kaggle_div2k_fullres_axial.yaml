@@ -66,8 +66,13 @@ model:
   heads: 8
   max_residual: 1.0
   noise_variance_min: 0.0001
+  # Retained for bounded/legacy checkpoints. The full-resolution experiment
+  # below learns an unbounded softplus amplitude instead of using this ceiling.
   noise_variance_max: 2.0
   noise_variance_init: 0.1
+  noise_energy_parameterization: softplus_amplitude
+  # Numerical AMP guard only: amplitude 8 corresponds to total energy 64.
+  noise_amplitude_safety_max: 8.0
   fullres_dim: 320
   fullres_depth: 12
   fullres_cross_depth: 2

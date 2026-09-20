@@ -128,7 +128,10 @@ def validate(
     max_batches: int,
 ) -> dict[str, float]:
     model.eval()
-    totals = torch.zeros(7, device=device)
+    # loss, input/output PSNR, mean energy, count, cloud/spatial loss,
+    # and per-image spatial-energy p50/p95/p99/max.
+    totals = torch.zeros(11, device=device)
+    energy_quantile_levels = torch.tensor([0.50, 0.95, 0.99], device=device)
     for batch_index, raw in enumerate(loader):
         if max_batches and batch_index >= max_batches:
             break
@@ -144,7 +147,10 @@ def validate(
                 samples=samples,
                 noise=batch["target_noise"] if paired else None,
                 return_noise_variance=True,
-                return_noise_energy=spatial_criterion is not None,
+                return_noise_energy=(
+                    spatial_criterion is not None
+                    or getattr(model, "architecture", "") == "fullres_axial"
+                ),
             )
             if not isinstance(model_output, tuple):
                 raise RuntimeError("model did not return its noise variance")
@@ -160,6 +166,17 @@ def validate(
             loss = cloud_loss + spatial_ce_weight * spatial_loss
         count = batch["clean"].shape[0]
         output_mean = predicted.float().mean(1)
+        if len(model_output) == 3:
+            energy_flat = model_output[2].detach().float().flatten(1)
+            energy_quantiles = torch.quantile(
+                energy_flat,
+                energy_quantile_levels,
+                dim=1,
+            ).sum(dim=1)
+            energy_max = energy_flat.max(dim=1).values.sum()
+        else:
+            energy_quantiles = torch.zeros(3, device=device)
+            energy_max = torch.zeros((), device=device)
         totals += torch.tensor(
             [
                 loss.float().item() * count,
@@ -169,6 +186,10 @@ def validate(
                 count,
                 cloud_loss.float().item() * count,
                 spatial_loss.float().item() * count,
+                energy_quantiles[0].item(),
+                energy_quantiles[1].item(),
+                energy_quantiles[2].item(),
+                energy_max.item(),
             ],
             device=device,
         )
@@ -181,6 +202,10 @@ def validate(
         "val_noise_variance": totals[3].item() / denominator,
         "val_cloud_loss": totals[5].item() / denominator,
         "val_spatial_ce": totals[6].item() / denominator,
+        "val_noise_energy_p50": totals[7].item() / denominator,
+        "val_noise_energy_p95": totals[8].item() / denominator,
+        "val_noise_energy_p99": totals[9].item() / denominator,
+        "val_noise_energy_max": totals[10].item() / denominator,
     }
 
 

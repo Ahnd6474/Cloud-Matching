@@ -436,11 +436,21 @@ model:
   fullres_ffn_ratio: 2.0
   fullres_window_size: 8
   fullres_gradient_checkpointing: true
+  noise_variance_init: 0.1
+  noise_energy_parameterization: softplus_amplitude
+  noise_amplitude_safety_max: 8.0
 loss:
   name: energy_full_band
   samples: 4
   spatial_ce_weight: 0.05
 ```
+
+With `softplus_amplitude`, the full-resolution model predicts a positive noise
+amplitude `a` and injects `a * epsilon / sqrt(D)`. The reported spatial energy
+is `w = noise_variance_min + a^2`, so it is learned without the sigmoid ceiling
+used by legacy bounded checkpoints. `noise_amplitude_safety_max` is only a
+distant mixed-precision guard; the default value corresponds to total energy
+64 rather than a normal training target.
 
 The ViT path creates tokens directly with an 8x8 patch embedding, applies
 self-attention, and learns a feature pyramid for the residual decoder. It is
