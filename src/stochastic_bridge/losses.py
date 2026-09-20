@@ -208,6 +208,91 @@ class PairedFullBandCloudLoss(nn.Module):
         )
 
 
+class PairedMeanDeviationFullBandLoss(nn.Module):
+    """Pixel-accurate paired loss with explicit stochastic supervision.
+
+    The cloud mean and the noise-conditioned deviations are supervised
+    separately.  Predicting the same mean image for every noise sample can
+    therefore minimize the mean term, but not the deviation term.  A small
+    output-space standard-deviation term calibrates diversity without trying
+    to assign physical meaning to an internal latent energy scale.
+    """
+
+    def __init__(
+        self,
+        levels: int = 3,
+        charbonnier_epsilon: float = 1e-3,
+        high_band_weight: float = 1.0,
+        low_band_weight: float = 1.0,
+        mean_weight: float = 1.0,
+        deviation_weight: float = 1.0,
+        variance_weight: float = 0.1,
+    ) -> None:
+        super().__init__()
+        if mean_weight <= 0.0 or deviation_weight <= 0.0:
+            raise ValueError("paired mean and deviation weights must be positive")
+        if variance_weight < 0.0:
+            raise ValueError("paired variance weight must be non-negative")
+        self.mean_weight = mean_weight
+        self.deviation_weight = deviation_weight
+        self.variance_weight = variance_weight
+        self.variance_epsilon = charbonnier_epsilon
+        self.full_band = PairedFullBandCloudLoss(
+            levels=levels,
+            charbonnier_epsilon=charbonnier_epsilon,
+            high_band_weight=high_band_weight,
+            low_band_weight=low_band_weight,
+        )
+
+    def components(
+        self,
+        predicted_cloud: Tensor,
+        target_cloud: Tensor,
+        current: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        if predicted_cloud.shape != target_cloud.shape:
+            raise ValueError(
+                "paired mean/deviation loss requires equal cloud shapes"
+            )
+        if predicted_cloud.ndim != 5:
+            raise ValueError("clouds must have shape [B,S,C,H,W]")
+
+        predicted_mean = predicted_cloud.mean(dim=1, keepdim=True)
+        target_mean = target_cloud.mean(dim=1, keepdim=True)
+        mean_loss = self.full_band(predicted_mean, target_mean, current)
+
+        predicted_deviation = predicted_cloud - predicted_mean
+        target_deviation = target_cloud - target_mean
+        deviation_loss = self.full_band(
+            predicted_deviation,
+            target_deviation,
+            torch.zeros_like(current),
+        )
+
+        epsilon_sq = self.variance_epsilon**2
+        predicted_std = (
+            predicted_deviation.float().square().mean(dim=1) + epsilon_sq
+        ).sqrt()
+        target_std = (
+            target_deviation.float().square().mean(dim=1) + epsilon_sq
+        ).sqrt()
+        variance_loss = F.smooth_l1_loss(predicted_std, target_std)
+        total = (
+            self.mean_weight * mean_loss
+            + self.deviation_weight * deviation_loss
+            + self.variance_weight * variance_loss
+        )
+        return total, mean_loss, deviation_loss, variance_loss
+
+    def forward(
+        self,
+        predicted_cloud: Tensor,
+        target_cloud: Tensor,
+        current: Tensor,
+    ) -> Tensor:
+        return self.components(predicted_cloud, target_cloud, current)[0]
+
+
 class EnergyCorrectionCloudLoss(nn.Module):
     """Energy distance between implicit correction ensembles."""
 
@@ -322,7 +407,11 @@ def _cloud_features(features: nn.Module, cloud: Tensor) -> Tensor:
 
 
 def is_paired_cloud_loss(name: str) -> bool:
-    return name.strip().lower() in {"paired", "paired_full_band"}
+    return name.strip().lower() in {
+        "paired",
+        "paired_full_band",
+        "paired_mean_deviation_full_band",
+    }
 
 
 def build_cloud_loss(
@@ -332,6 +421,9 @@ def build_cloud_loss(
     full_band_charbonnier_epsilon: float = 1e-3,
     full_band_high_weight: float = 1.0,
     full_band_low_weight: float = 1.0,
+    paired_mean_weight: float = 1.0,
+    paired_deviation_weight: float = 1.0,
+    paired_variance_weight: float = 0.1,
 ) -> nn.Module:
     normalized = name.strip().lower()
     if normalized == "paired":
@@ -343,6 +435,16 @@ def build_cloud_loss(
             high_band_weight=full_band_high_weight,
             low_band_weight=full_band_low_weight,
         )
+    if normalized == "paired_mean_deviation_full_band":
+        return PairedMeanDeviationFullBandLoss(
+            levels=full_band_levels,
+            charbonnier_epsilon=full_band_charbonnier_epsilon,
+            high_band_weight=full_band_high_weight,
+            low_band_weight=full_band_low_weight,
+            mean_weight=paired_mean_weight,
+            deviation_weight=paired_deviation_weight,
+            variance_weight=paired_variance_weight,
+        )
     if normalized == "energy":
         return EnergyCorrectionCloudLoss()
     if normalized == "energy_full_band":
@@ -350,6 +452,6 @@ def build_cloud_loss(
     if normalized == "sinkhorn":
         return SinkhornCorrectionCloudLoss(blur=blur)
     raise ValueError(
-        f"unknown loss '{name}'; choose paired, paired_full_band, energy, "
-        "energy_full_band, or sinkhorn"
+        f"unknown loss '{name}'; choose paired, paired_full_band, "
+        "paired_mean_deviation_full_band, energy, energy_full_band, or sinkhorn"
     )

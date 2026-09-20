@@ -8,6 +8,7 @@ from stochastic_bridge import (
     EnergyCorrectionCloudLoss,
     FullBandEnergyCorrectionCloudLoss,
     PairedFullBandCloudLoss,
+    PairedMeanDeviationFullBandLoss,
     PairedCorrectionLoss,
     SpatialNoiseCrossEntropyLoss,
     SinkhornCorrectionCloudLoss,
@@ -259,6 +260,39 @@ def test_full_band_paired_loss_is_zero_for_identical_cloud_and_backpropagates() 
     assert torch.isfinite(predicted.grad).all()
 
 
+def test_paired_mean_deviation_loss_penalizes_mean_collapse() -> None:
+    current = torch.zeros(1, 3, 16, 16)
+    base = torch.randn(1, 1, 3, 16, 16) * 0.1
+    deviation = torch.randn(1, 4, 3, 16, 16) * 0.2
+    deviation = deviation - deviation.mean(dim=1, keepdim=True)
+    target = base + deviation
+    collapsed = base.expand_as(target).clone().requires_grad_(True)
+    criterion = PairedMeanDeviationFullBandLoss(variance_weight=0.1)
+
+    total, mean_loss, deviation_loss, variance_loss = criterion.components(
+        collapsed, target, current
+    )
+    assert mean_loss.item() < 1e-6
+    assert deviation_loss.item() > 1e-2
+    assert variance_loss.item() > 0.0
+    total.backward()
+    assert collapsed.grad is not None
+    assert torch.isfinite(collapsed.grad).all()
+
+
+def test_paired_mean_deviation_loss_is_zero_for_identical_clouds() -> None:
+    current = torch.randn(2, 3, 16, 16)
+    target = torch.randn(2, 4, 3, 16, 16)
+    criterion = PairedMeanDeviationFullBandLoss()
+    total, mean_loss, deviation_loss, variance_loss = criterion.components(
+        target, target, current
+    )
+    torch.testing.assert_close(total, torch.zeros_like(total))
+    torch.testing.assert_close(mean_loss, torch.zeros_like(mean_loss))
+    torch.testing.assert_close(deviation_loss, torch.zeros_like(deviation_loss))
+    torch.testing.assert_close(variance_loss, torch.zeros_like(variance_loss))
+
+
 @pytest.mark.parametrize("encoder_type", ["cnn", "vit"])
 def test_both_shared_encoder_types(encoder_type: str) -> None:
     model = StochasticImageBridge(
@@ -411,6 +445,35 @@ def test_softplus_amplitude_energy_has_no_legacy_sigmoid_ceiling() -> None:
     model.fullres.reset_energy_head(2.0)
     reset = model.fullres.spatial_energy(condition)
     torch.testing.assert_close(reset, torch.full_like(reset, 2.0))
+
+
+def test_fixed_unit_energy_is_dimension_normalized_and_not_trainable() -> None:
+    model = StochasticImageBridge(
+        architecture="fullres_axial",
+        heads=2,
+        noise_variance_min=1e-4,
+        noise_variance_max=2.0,
+        noise_variance_init=1.0,
+        noise_energy_parameterization="fixed_unit",
+        fullres_dim=16,
+        fullres_depth=1,
+        fullres_cross_depth=1,
+        fullres_window_size=4,
+        fullres_gradient_checkpointing=False,
+    )
+    current = torch.randn(2, 3, 8, 8).clamp(-1.0, 1.0)
+    goal = torch.randn(2, 3, 8, 8).clamp(-1.0, 1.0)
+    cloud, variance, energy = model(
+        current,
+        goal,
+        samples=2,
+        return_noise_variance=True,
+        return_noise_energy=True,
+    )
+    torch.testing.assert_close(energy, torch.ones_like(energy))
+    torch.testing.assert_close(variance, torch.ones_like(variance))
+    cloud.mean().backward()
+    assert model.fullres.energy_head.weight.grad is None
 
 
 def test_spatial_noise_ce_teaches_relative_location_not_strength() -> None:

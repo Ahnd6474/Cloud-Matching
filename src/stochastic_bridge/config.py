@@ -149,6 +149,9 @@ class LossConfig:
     full_band_charbonnier_epsilon: float = 1e-3
     full_band_high_weight: float = 1.0
     full_band_low_weight: float = 1.0
+    paired_mean_weight: float = 1.0
+    paired_deviation_weight: float = 1.0
+    paired_variance_weight: float = 0.1
     spatial_ce_weight: float = 0.0
     spatial_ce_highpass: bool = True
     spatial_ce_kernel_size: int = 5

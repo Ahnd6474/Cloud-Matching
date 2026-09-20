@@ -586,6 +586,11 @@ class FullResolutionAxialCore(nn.Module):
         """Reset only the sampler scale when changing its parameterization."""
         if initial_energy <= self.noise_energy_min:
             raise ValueError("initial energy must be strictly above its minimum")
+        if self.noise_energy_parameterization == "fixed_unit":
+            # This head is deliberately disconnected in fixed-unit mode.
+            nn.init.zeros_(self.energy_head.weight)
+            nn.init.zeros_(self.energy_head.bias)
+            return
         if self.noise_energy_parameterization == "bounded":
             if initial_energy >= self.noise_energy_max:
                 raise ValueError("bounded initial energy must be below its maximum")
@@ -624,6 +629,11 @@ class FullResolutionAxialCore(nn.Module):
         return current_tokens
 
     def spatial_energy(self, condition: Tensor) -> Tensor:
+        if self.noise_energy_parameterization == "fixed_unit":
+            # `_latent_noise` has unit variance in each feature coordinate.
+            # decode divides it by sqrt(dim), so E||e||^2 = 1 per pixel.
+            # Actual diversity is calibrated in output space by the loss.
+            return condition.new_ones(condition.shape[:-1])
         raw = self.energy_head(self.energy_norm(condition))
         if self.noise_energy_parameterization == "bounded":
             unit_energy = torch.sigmoid(raw)
@@ -757,19 +767,19 @@ class StochasticImageBridge(nn.Module):
         )
         if normalized_energy_parameterization not in {
             "bounded",
+            "fixed_unit",
             "softplus_amplitude",
         }:
             raise ValueError(
-                "noise_energy_parameterization must be 'bounded' or "
-                "'softplus_amplitude'"
+                "noise_energy_parameterization must be 'bounded', "
+                "'fixed_unit', or 'softplus_amplitude'"
             )
         if (
             normalized_architecture != "fullres_axial"
             and normalized_energy_parameterization != "bounded"
         ):
             raise ValueError(
-                "softplus_amplitude noise energy is available only for "
-                "fullres_axial"
+                "non-bounded noise energy modes are available only for fullres_axial"
             )
         if not 0.0 <= noise_variance_min < noise_variance_max:
             raise ValueError("noise_variance_min must be non-negative and below max")

@@ -20,6 +20,7 @@ from tqdm.auto import tqdm
 
 from stochastic_bridge.config import load_config
 from stochastic_bridge.losses import (
+    PairedMeanDeviationFullBandLoss,
     SpatialNoiseCrossEntropyLoss,
     build_cloud_loss,
     is_paired_cloud_loss,
@@ -40,6 +41,11 @@ def parse_args() -> argparse.Namespace:
         "--init-checkpoint",
         default="",
         help="Load model weights only and start a fresh fine-tuning schedule",
+    )
+    parser.add_argument(
+        "--reset-energy-head",
+        action="store_true",
+        help="Reset the spatial energy head after loading initialization weights",
     )
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--max-train-batches", type=int, default=0)
@@ -102,6 +108,24 @@ def reduce_totals(values: Tensor, world_size: int) -> Tensor:
 def psnr(predicted: Tensor, target: Tensor) -> Tensor:
     mse = (predicted - target).square().flatten(1).mean(1).clamp_min(1e-10)
     return 10.0 * torch.log10(4.0 / mse)
+
+
+def cloud_loss_components(
+    criterion: nn.Module,
+    predicted_cloud: Tensor,
+    target_cloud: Tensor,
+    current: Tensor,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    if isinstance(criterion, PairedMeanDeviationFullBandLoss):
+        return criterion.components(predicted_cloud, target_cloud, current)
+    total = criterion(predicted_cloud, target_cloud, current)
+    zero = total.new_zeros(())
+    return total, zero, zero, zero
+
+
+def cloud_diversity(cloud: Tensor) -> Tensor:
+    """Mean per-pixel sample standard deviation for each condition."""
+    return cloud.detach().float().std(dim=1, unbiased=False).mean(dim=(1, 2, 3))
 
 
 def move_batch(
@@ -203,7 +227,7 @@ def validate(
     model.eval()
     # loss, input/output PSNR, mean energy, count, cloud/spatial loss,
     # and per-image spatial-energy p50/p95/p99/max.
-    totals = torch.zeros(11, device=device)
+    totals = torch.zeros(24, device=device)
     energy_quantile_levels = torch.tensor([0.50, 0.95, 0.99], device=device)
     for batch_index, raw in enumerate(loader):
         if max_batches and batch_index >= max_batches:
@@ -228,7 +252,8 @@ def validate(
             if not isinstance(model_output, tuple):
                 raise RuntimeError("model did not return its noise variance")
             predicted, noise_variance = model_output[:2]
-            cloud_loss = criterion(
+            cloud_loss, mean_loss, deviation_loss, variance_loss = cloud_loss_components(
+                criterion,
                 predicted, batch["target_cloud"], batch["current"]
             )
             spatial_loss = cloud_loss.new_zeros(())
@@ -248,6 +273,13 @@ def validate(
             )
         count = batch["clean"].shape[0]
         output_mean = predicted.float().mean(1)
+        predicted_diversity = cloud_diversity(predicted)
+        target_diversity = cloud_diversity(batch["target_cloud"])
+        clean_endpoint = batch["answer_level"].eq(0)
+        transition_endpoint = ~clean_endpoint
+        clean_count = clean_endpoint.sum()
+        transition_count = transition_endpoint.sum()
+        energy_per_image = noise_variance.detach().float().flatten()
         if len(model_output) == 3:
             energy_flat = model_output[2].detach().float().flatten(1)
             energy_quantiles = torch.quantile(
@@ -259,24 +291,38 @@ def validate(
         else:
             energy_quantiles = torch.zeros(3, device=device)
             energy_max = torch.zeros((), device=device)
-        totals += torch.tensor(
+        totals += torch.stack(
             [
-                loss.float().item() * count,
-                psnr(batch["current"].float(), batch["clean"].float()).sum().item(),
-                psnr(output_mean, batch["clean"].float()).sum().item(),
-                noise_variance.float().sum().item(),
-                count,
-                cloud_loss.float().item() * count,
-                spatial_loss.float().item() * count,
-                energy_quantiles[0].item(),
-                energy_quantiles[1].item(),
-                energy_quantiles[2].item(),
-                energy_max.item(),
+                loss.float() * count,
+                psnr(batch["current"].float(), batch["clean"].float()).sum(),
+                psnr(output_mean, batch["clean"].float()).sum(),
+                noise_variance.float().sum(),
+                torch.tensor(float(count), device=device),
+                cloud_loss.float() * count,
+                spatial_loss.float() * count,
+                energy_quantiles[0],
+                energy_quantiles[1],
+                energy_quantiles[2],
+                energy_max,
+                mean_loss.float() * count,
+                deviation_loss.float() * count,
+                variance_loss.float() * count,
+                predicted_diversity.sum(),
+                target_diversity.sum(),
+                predicted_diversity[clean_endpoint].sum(),
+                target_diversity[clean_endpoint].sum(),
+                energy_per_image[clean_endpoint].sum(),
+                clean_count.float(),
+                predicted_diversity[transition_endpoint].sum(),
+                target_diversity[transition_endpoint].sum(),
+                energy_per_image[transition_endpoint].sum(),
+                transition_count.float(),
             ],
-            device=device,
         )
     model.train()
     denominator = max(totals[4].item(), 1.0)
+    clean_denominator = max(totals[19].item(), 1.0)
+    transition_denominator = max(totals[23].item(), 1.0)
     return {
         "val_loss": totals[0].item() / denominator,
         "val_current_psnr": totals[1].item() / denominator,
@@ -288,6 +334,20 @@ def validate(
         "val_noise_energy_p95": totals[8].item() / denominator,
         "val_noise_energy_p99": totals[9].item() / denominator,
         "val_noise_energy_max": totals[10].item() / denominator,
+        "val_paired_mean_loss": totals[11].item() / denominator,
+        "val_paired_deviation_loss": totals[12].item() / denominator,
+        "val_paired_variance_loss": totals[13].item() / denominator,
+        "val_predicted_diversity": totals[14].item() / denominator,
+        "val_target_diversity": totals[15].item() / denominator,
+        "val_clean_predicted_diversity": totals[16].item() / clean_denominator,
+        "val_clean_target_diversity": totals[17].item() / clean_denominator,
+        "val_clean_noise_variance": totals[18].item() / clean_denominator,
+        "val_transition_predicted_diversity": totals[20].item()
+        / transition_denominator,
+        "val_transition_target_diversity": totals[21].item()
+        / transition_denominator,
+        "val_transition_noise_variance": totals[22].item()
+        / transition_denominator,
     }
 
 
@@ -409,6 +469,9 @@ def main() -> None:
         full_band_charbonnier_epsilon=config.loss.full_band_charbonnier_epsilon,
         full_band_high_weight=config.loss.full_band_high_weight,
         full_band_low_weight=config.loss.full_band_low_weight,
+        paired_mean_weight=config.loss.paired_mean_weight,
+        paired_deviation_weight=config.loss.paired_deviation_weight,
+        paired_variance_weight=config.loss.paired_variance_weight,
     ).to(device)
     spatial_criterion = (
         SpatialNoiseCrossEntropyLoss(
@@ -451,7 +514,14 @@ def main() -> None:
         source_energy_parameterization = source_model_config.get(
             "noise_energy_parameterization", "bounded"
         )
-        if (
+        if args.reset_energy_head and model.architecture == "fullres_axial":
+            model.fullres.reset_energy_head(config.model.noise_variance_init)
+            if is_main:
+                print(
+                    "reset energy head by request; "
+                    f"initial energy={config.model.noise_variance_init:g}"
+                )
+        elif (
             model.architecture == "fullres_axial"
             and source_energy_parameterization
             != config.model.noise_energy_parameterization
@@ -489,7 +559,7 @@ def main() -> None:
     for epoch in range(start_epoch, config.train.epochs):
         train_sampler.set_epoch(epoch)
         train_model.train()
-        totals = torch.zeros(7, device=device)
+        totals = torch.zeros(12, device=device)
         progress = tqdm(
             train_loader,
             desc=f"epoch {epoch + 1}/{config.train.epochs}",
@@ -516,7 +586,8 @@ def main() -> None:
                 if not isinstance(model_output, tuple):
                     raise RuntimeError("model did not return its noise variance")
                 predicted, noise_variance = model_output[:2]
-                cloud_loss = criterion(
+                cloud_loss, mean_loss, deviation_loss, variance_loss = cloud_loss_components(
+                    criterion,
                     predicted, batch["target_cloud"], batch["current"]
                 )
                 spatial_loss = cloud_loss.new_zeros(())
@@ -534,6 +605,8 @@ def main() -> None:
             scaler.update()
 
             count = batch["clean"].shape[0]
+            predicted_diversity = cloud_diversity(predicted)
+            target_diversity = cloud_diversity(batch["target_cloud"])
             totals += torch.stack(
                 [
                     loss.detach().float() * count,
@@ -545,6 +618,11 @@ def main() -> None:
                     torch.tensor(float(count), device=device),
                     cloud_loss.detach().float() * count,
                     spatial_loss.detach().float() * count,
+                    mean_loss.detach().float() * count,
+                    deviation_loss.detach().float() * count,
+                    variance_loss.detach().float() * count,
+                    predicted_diversity.sum(),
+                    target_diversity.sum(),
                 ]
             )
             if is_main and (batch_index + 1) % config.train.log_every == 0:
@@ -557,6 +635,23 @@ def main() -> None:
                 )
                 writer.add_scalar(
                     "batch/train_spatial_ce", spatial_loss.item(), global_step
+                )
+                writer.add_scalar("batch/paired_mean_loss", mean_loss.item(), global_step)
+                writer.add_scalar(
+                    "batch/paired_deviation_loss", deviation_loss.item(), global_step
+                )
+                writer.add_scalar(
+                    "batch/paired_variance_loss", variance_loss.item(), global_step
+                )
+                writer.add_scalar(
+                    "batch/predicted_diversity",
+                    predicted_diversity.mean().item(),
+                    global_step,
+                )
+                writer.add_scalar(
+                    "batch/target_diversity",
+                    target_diversity.mean().item(),
+                    global_step,
                 )
                 writer.add_scalar(
                     "batch/noise_variance", noise_variance.float().mean().item(), global_step
@@ -576,6 +671,11 @@ def main() -> None:
             "train_noise_variance": totals[3].item() / count,
             "train_cloud_loss": totals[5].item() / count,
             "train_spatial_ce": totals[6].item() / count,
+            "train_paired_mean_loss": totals[7].item() / count,
+            "train_paired_deviation_loss": totals[8].item() / count,
+            "train_paired_variance_loss": totals[9].item() / count,
+            "train_predicted_diversity": totals[10].item() / count,
+            "train_target_diversity": totals[11].item() / count,
             "learning_rate": optimizer.param_groups[0]["lr"],
         }
         # Advance before checkpointing so a resumed run uses the exact next-
