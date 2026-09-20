@@ -408,6 +408,10 @@ def test_softplus_amplitude_energy_has_no_legacy_sigmoid_ceiling() -> None:
     assert model.fullres.energy_head.bias.grad is not None
     assert model.fullres.energy_head.bias.grad.abs().item() > 0.0
 
+    model.fullres.reset_energy_head(2.0)
+    reset = model.fullres.spatial_energy(condition)
+    torch.testing.assert_close(reset, torch.full_like(reset, 2.0))
+
 
 def test_spatial_noise_ce_teaches_relative_location_not_strength() -> None:
     current = torch.zeros(1, 3, 8, 8)

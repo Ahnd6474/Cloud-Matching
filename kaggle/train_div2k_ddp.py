@@ -13,7 +13,9 @@ import torch
 import torch.distributed as dist
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader, DistributedSampler
+from torchvision.utils import make_grid
 from tqdm.auto import tqdm
 
 from stochastic_bridge.config import load_config
@@ -42,6 +44,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--max-train-batches", type=int, default=0)
     parser.add_argument("--max-val-batches", type=int, default=0)
+    parser.add_argument(
+        "--tensorboard-dir",
+        default="",
+        help="TensorBoard log directory (default: OUTPUT/tensorboard)",
+    )
+    parser.add_argument(
+        "--validation-images",
+        type=int,
+        default=4,
+        help="Number of validation examples to visualize per epoch (0 disables)",
+    )
     return parser.parse_args()
 
 
@@ -113,6 +126,63 @@ def move_batch(
     return moved
 
 
+def display_image(images: Tensor) -> Tensor:
+    """Detach normalized model images and map [-1, 1] into [0, 1]."""
+    return ((images.detach().float().cpu().clamp(-1.0, 1.0) + 1.0) / 2.0)
+
+
+def log_validation_images(
+    writer: SummaryWriter,
+    batch: dict[str, Tensor],
+    predicted: Tensor,
+    noise_energy: Tensor | None,
+    epoch: int,
+    count: int,
+) -> None:
+    """Log aligned validation inputs, targets, predictions, and energy maps."""
+    count = min(count, batch["clean"].shape[0])
+    if count < 1:
+        return
+
+    images = {
+        "clean": display_image(batch["clean"][:count]),
+        "goal": display_image(batch["goal"][:count]),
+        "current": display_image(batch["current"][:count]),
+        "target_mean": display_image(batch["target_cloud"][:count].mean(1)),
+        "prediction_mean": display_image(predicted[:count].mean(1)),
+        "prediction_sample_0": display_image(predicted[:count, 0]),
+    }
+    if noise_energy is not None:
+        energy = noise_energy[:count].detach().float().cpu()
+        if energy.ndim == 3:
+            energy = energy[:, None]
+        flat = energy.flatten(1)
+        minimum = flat.min(dim=1).values[:, None, None, None]
+        maximum = flat.max(dim=1).values[:, None, None, None]
+        normalized = (energy - minimum) / (maximum - minimum).clamp_min(1e-8)
+        images["noise_energy_normalized"] = normalized.repeat(1, 3, 1, 1)
+        writer.add_histogram(
+            "validation/noise_energy_distribution",
+            energy,
+            global_step=epoch,
+        )
+
+    # Each example occupies one row; columns follow the order in `images`.
+    comparison = torch.stack(list(images.values()), dim=1).flatten(0, 1)
+    writer.add_image(
+        "validation/comparison",
+        make_grid(comparison, nrow=len(images), padding=2),
+        global_step=epoch,
+    )
+    for name, value in images.items():
+        writer.add_images(f"validation/{name}", value, global_step=epoch)
+    writer.add_text(
+        "validation/comparison_columns",
+        " | ".join(images),
+        global_step=epoch,
+    )
+
+
 @torch.no_grad()
 def validate(
     model: nn.Module,
@@ -126,6 +196,9 @@ def validate(
     channels_last: bool,
     amp_enabled: bool,
     max_batches: int,
+    writer: SummaryWriter | None = None,
+    epoch: int = 0,
+    validation_images: int = 0,
 ) -> dict[str, float]:
     model.eval()
     # loss, input/output PSNR, mean energy, count, cloud/spatial loss,
@@ -164,6 +237,15 @@ def validate(
                     model_output[2], batch["target_cloud"], batch["current"]
                 )
             loss = cloud_loss + spatial_ce_weight * spatial_loss
+        if batch_index == 0 and writer is not None and validation_images > 0:
+            log_validation_images(
+                writer,
+                batch,
+                predicted,
+                model_output[2] if len(model_output) == 3 else None,
+                epoch,
+                validation_images,
+            )
         count = batch["clean"].shape[0]
         output_mean = predicted.float().mean(1)
         if len(model_output) == 3:
@@ -365,6 +447,23 @@ def main() -> None:
     if args.init_checkpoint:
         state = torch.load(args.init_checkpoint, map_location=device, weights_only=False)
         model.load_state_dict(state["model"])
+        source_model_config = state.get("config", {}).get("model", {})
+        source_energy_parameterization = source_model_config.get(
+            "noise_energy_parameterization", "bounded"
+        )
+        if (
+            model.architecture == "fullres_axial"
+            and source_energy_parameterization
+            != config.model.noise_energy_parameterization
+        ):
+            model.fullres.reset_energy_head(config.model.noise_variance_init)
+            if is_main:
+                print(
+                    "reset energy head after parameterization change: "
+                    f"{source_energy_parameterization} -> "
+                    f"{config.model.noise_energy_parameterization}; "
+                    f"initial energy={config.model.noise_variance_init:g}"
+                )
         if is_main:
             print(f"initialized model weights from {args.init_checkpoint}")
     if resume:
@@ -376,6 +475,16 @@ def main() -> None:
         history = state.get("history", [])
         start_epoch = int(state.get("epoch", 0))
         best_val = min((row["val_loss"] for row in history), default=math.inf)
+
+    writer = None
+    if is_main:
+        tensorboard_dir = (
+            Path(args.tensorboard_dir).resolve()
+            if args.tensorboard_dir
+            else output / "tensorboard"
+        )
+        writer = SummaryWriter(log_dir=tensorboard_dir)
+        writer.add_text("run/config", json.dumps(config.to_dict(), indent=2), 0)
 
     for epoch in range(start_epoch, config.train.epochs):
         train_sampler.set_epoch(epoch)
@@ -440,6 +549,22 @@ def main() -> None:
             )
             if is_main and (batch_index + 1) % config.train.log_every == 0:
                 progress.set_postfix(loss=f"{loss.item():.4f}")
+                assert writer is not None
+                global_step = epoch * len(train_loader) + batch_index + 1
+                writer.add_scalar("batch/train_loss", loss.item(), global_step)
+                writer.add_scalar(
+                    "batch/train_cloud_loss", cloud_loss.item(), global_step
+                )
+                writer.add_scalar(
+                    "batch/train_spatial_ce", spatial_loss.item(), global_step
+                )
+                writer.add_scalar(
+                    "batch/noise_variance", noise_variance.float().mean().item(), global_step
+                )
+                writer.add_scalar("batch/gradient_norm", grad_norm.item(), global_step)
+                writer.add_scalar(
+                    "batch/learning_rate", optimizer.param_groups[0]["lr"], global_step
+                )
 
         totals = reduce_totals(totals, world_size)
         count = max(totals[4].item(), 1.0)
@@ -474,9 +599,17 @@ def main() -> None:
                     channels_last,
                     amp_enabled,
                     args.max_val_batches,
+                    writer,
+                    epoch + 1,
+                    args.validation_images,
                 )
             )
             history.append(metrics)
+            assert writer is not None
+            for name, value in metrics.items():
+                if name != "epoch":
+                    writer.add_scalar(f"epoch/{name}", value, epoch + 1)
+            writer.flush()
             (output / "history.json").write_text(
                 json.dumps(history, indent=2), encoding="utf-8"
             )
@@ -517,6 +650,8 @@ def main() -> None:
             history,
             config.to_dict(),
         )
+        assert writer is not None
+        writer.close()
     if world_size > 1:
         dist.destroy_process_group()
 

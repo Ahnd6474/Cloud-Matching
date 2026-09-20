@@ -573,18 +573,7 @@ class FullResolutionAxialCore(nn.Module):
         )
         self.energy_norm = nn.LayerNorm(dim)
         self.energy_head = nn.Linear(dim, 1)
-        if noise_energy_parameterization == "bounded":
-            fraction = (noise_energy_init - noise_energy_min) / (
-                noise_energy_max - noise_energy_min
-            )
-            energy_bias = math.log(fraction / (1.0 - fraction))
-        else:
-            initial_amplitude = math.sqrt(noise_energy_init - noise_energy_min)
-            # Inverse softplus makes the initial total energy exactly
-            # ``noise_energy_init`` while leaving its learned scale unbounded.
-            energy_bias = math.log(math.expm1(initial_amplitude))
-        nn.init.zeros_(self.energy_head.weight)
-        nn.init.constant_(self.energy_head.bias, energy_bias)
+        self.reset_energy_head(noise_energy_init)
         projection = torch.randn(dim, in_channels)
         projection = projection / projection.norm(dim=1, keepdim=True).clamp_min(1e-8)
         self.register_buffer("rgb_noise_projection", projection)
@@ -592,6 +581,27 @@ class FullResolutionAxialCore(nn.Module):
         self.output_head = nn.Linear(dim, in_channels)
         nn.init.normal_(self.output_head.weight, std=1e-3)
         nn.init.zeros_(self.output_head.bias)
+
+    def reset_energy_head(self, initial_energy: float) -> None:
+        """Reset only the sampler scale when changing its parameterization."""
+        if initial_energy <= self.noise_energy_min:
+            raise ValueError("initial energy must be strictly above its minimum")
+        if self.noise_energy_parameterization == "bounded":
+            if initial_energy >= self.noise_energy_max:
+                raise ValueError("bounded initial energy must be below its maximum")
+            fraction = (initial_energy - self.noise_energy_min) / (
+                self.noise_energy_max - self.noise_energy_min
+            )
+            energy_bias = math.log(fraction / (1.0 - fraction))
+        else:
+            initial_amplitude = math.sqrt(initial_energy - self.noise_energy_min)
+            if initial_amplitude >= self.noise_amplitude_safety_max:
+                raise ValueError("initial amplitude must be below its safety limit")
+            # Inverse softplus makes the initial total energy exact while
+            # leaving the learned operating scale without a sigmoid ceiling.
+            energy_bias = math.log(math.expm1(initial_amplitude))
+        nn.init.zeros_(self.energy_head.weight)
+        nn.init.constant_(self.energy_head.bias, energy_bias)
 
     def encode_condition(self, current: Tensor, goal: Tensor) -> Tensor:
         batch, _, height, width = current.shape
