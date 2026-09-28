@@ -1,0 +1,213 @@
+{
+  "format_version": 2,
+  "storage": "uint8_-1_1",
+  "length": 200,
+  "has_target_noise": false,
+  "target_noise_storage": "none",
+  "corruption_names": [
+    "white_gaussian",
+    "local_gaussian",
+    "edge_gaussian",
+    "low_frequency_gaussian",
+    "high_frequency_gaussian",
+    "band_pass_gaussian",
+    "channel_correlated_gaussian",
+    "low_rank_gaussian",
+    "anisotropic_gaussian",
+    "signal_dependent_gaussian",
+    "student_t",
+    "laplace",
+    "poisson",
+    "speckle",
+    "impulse",
+    "blur",
+    "downsample",
+    "mask",
+    "texture_suppress",
+    "edge_erase"
+  ],
+  "shards": [
+    {
+      "file": "shard-000000.pt",
+      "count": 200
+    }
+  ],
+  "source_images": 100,
+  "source_roots": [
+    "/workspace/data/div2k/Dataset/DIV2K_valid_HR"
+  ],
+  "variants_per_image": 2,
+  "image_size": 128,
+  "channels": 3,
+  "target_samples": 4,
+  "analytic_vp": false,
+  "config": {
+    "data": {
+      "root": "",
+      "roots": [
+        "/workspace/data/div2k/Dataset/DIV2K_valid_HR"
+      ],
+      "prepared_root": "",
+      "prepared_cache_shards": 4,
+      "synthetic": false,
+      "synthetic_length": 32,
+      "image_size": 128,
+      "batch_size": 4,
+      "workers": 8,
+      "prefetch_factor": 4,
+      "random_crop": true,
+      "crop_mode": "native",
+      "horizontal_flip": true
+    },
+    "prepare": {
+      "variants_per_image": 4,
+      "shard_size": 256,
+      "batch_size": 32,
+      "workers": 8,
+      "seed": 31
+    },
+    "schedule": {
+      "steps": 1000,
+      "beta_start": 1e-05,
+      "beta_end": 0.002,
+      "answer_jump": 100,
+      "adaptive_answer_jump": true,
+      "near_clean_threshold": 200,
+      "near_clean_answer_jump": 20,
+      "near_clean_answer_jump_min": 5,
+      "mid_clean_threshold": 500,
+      "mid_clean_answer_jump": 50,
+      "mid_clean_answer_jump_min": 20,
+      "near_clean_probability": 0.35,
+      "clean_answer_probability": 0.0,
+      "goal_from_clean": true,
+      "answer_from_current": true
+    },
+    "corruption": {
+      "enabled": true,
+      "spatial_floor": 0.08,
+      "student_t_df": 3.0,
+      "weights": {
+        "white_gaussian": 12.0,
+        "local_gaussian": 3.0,
+        "edge_gaussian": 3.0,
+        "low_frequency_gaussian": 2.0,
+        "high_frequency_gaussian": 4.0,
+        "band_pass_gaussian": 2.0,
+        "channel_correlated_gaussian": 2.0,
+        "low_rank_gaussian": 1.0,
+        "anisotropic_gaussian": 2.0,
+        "signal_dependent_gaussian": 3.0
+      }
+    },
+    "endpoint_corruption": {
+      "enabled": false,
+      "probability": 0.0,
+      "spatial_floor": 0.08,
+      "student_t_df": 3.0,
+      "weights": {
+        "local_gaussian": 2.0,
+        "edge_gaussian": 2.0,
+        "high_frequency_gaussian": 1.0,
+        "texture_suppress": 3.0,
+        "edge_erase": 3.0,
+        "blur": 1.0,
+        "downsample": 1.0,
+        "mask": 1.0
+      }
+    },
+    "goal_corruption": {
+      "enabled": true,
+      "blur_probability": 1.0,
+      "downsample_probability": 0.0,
+      "mask_probability": 0.0,
+      "minimum_scale": 0.25,
+      "maximum_mask_fraction": 0.3
+    },
+    "model": {
+      "architecture": "fullres_axial",
+      "in_channels": 3,
+      "base_channels": 32,
+      "heads": 8,
+      "attention_depth": 2,
+      "max_residual": 1.0,
+      "noise_variance_min": 0.0001,
+      "noise_variance_max": 2.0,
+      "noise_variance_init": 1.0,
+      "noise_energy_parameterization": "fixed_unit",
+      "noise_amplitude_safety_max": 8.0,
+      "encoder_type": "cnn",
+      "vit_depth": 4,
+      "vit_patch_size": 8,
+      "decoder_type": "conv",
+      "implicit_hidden_dim": 128,
+      "implicit_depth": 3,
+      "implicit_fourier_bands": 6,
+      "implicit_chunk_size": 65536,
+      "fullres_dim": 320,
+      "fullres_depth": 12,
+      "fullres_cross_depth": 2,
+      "fullres_cross_gate_init": 0.5,
+      "fullres_ffn_ratio": 2.0,
+      "fullres_window_size": 8,
+      "fullres_gradient_checkpointing": false,
+      "fullres_random_attention": true,
+      "fullres_random_slots": 64,
+      "fullres_random_dim": 64,
+      "fullres_random_temperature": 0.8,
+      "fullres_random_gate1_init": 0.02,
+      "fullres_random_gate2_init": 0.01,
+      "fullres_random_positions": [
+        0,
+        4
+      ]
+    },
+    "loss": {
+      "name": "energy_full_band",
+      "samples": 4,
+      "sinkhorn_blur": 0.05,
+      "full_band_levels": 3,
+      "full_band_charbonnier_epsilon": 0.001,
+      "full_band_high_weight": 1.0,
+      "full_band_low_weight": 1.0,
+      "paired_mean_weight": 1.0,
+      "paired_deviation_weight": 1.0,
+      "paired_variance_weight": 0.1,
+      "perceptual_weight": 0.0,
+      "perceptual_pretrained": true,
+      "perceptual_stages": [
+        1,
+        2,
+        3,
+        5
+      ],
+      "perceptual_mean_weight": 1.0,
+      "perceptual_deviation_weight": 1.0,
+      "spatial_ce_weight": 0.0,
+      "spatial_ce_highpass": true,
+      "spatial_ce_kernel_size": 5
+    },
+    "train": {
+      "epochs": 30,
+      "learning_rate": 2e-05,
+      "lr_schedule": "fixed",
+      "weight_decay": 0.0001,
+      "grad_clip": 1.0,
+      "amp": true,
+      "amp_dtype": "float16",
+      "amp_init_scale": 1024.0,
+      "amp_growth_interval": 2000,
+      "channels_last": false,
+      "tf32": true,
+      "fused_optimizer": true,
+      "compile": true,
+      "compile_mode": "reduce-overhead",
+      "seed": 31,
+      "log_every": 20,
+      "preview_every": 200,
+      "save_every": 1000,
+      "output_dir": "/workspace/Cloud-Matching/outputs/l40_adaptive_gate_fast_scratch",
+      "resume": ""
+    }
+  }
+}

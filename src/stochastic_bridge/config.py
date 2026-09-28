@@ -10,6 +10,9 @@ import yaml
 @dataclass
 class DataConfig:
     root: str = ""
+    # Optional multi-dataset input. When non-empty this takes precedence over
+    # ``root`` and avoids copying multiple HR datasets into one directory.
+    roots: list[str] = field(default_factory=list)
     prepared_root: str = "data/prepared"
     prepared_cache_shards: int = 2
     synthetic: bool = False
@@ -38,9 +41,27 @@ class ScheduleConfig:
     beta_start: float = 1e-4
     beta_end: float = 2e-2
     answer_jump: int = 10
+    # Optionally make the denoising target progressively finer near x_0.  The
+    # two thresholds are inclusive and are applied only to current-relative
+    # targets.  A zero near_clean_probability keeps uniform level sampling.
+    adaptive_answer_jump: bool = False
+    near_clean_threshold: int = 20
+    near_clean_answer_jump: int = 2
+    near_clean_answer_jump_min: int = 0
+    mid_clean_threshold: int = 50
+    mid_clean_answer_jump: int = 5
+    mid_clean_answer_jump_min: int = 0
+    near_clean_probability: float = 0.0
     # In addition to ordinary short bridge transitions, explicitly train a
     # substantial fraction of arbitrary noisy states to terminate at x_0.
     clean_answer_probability: float = 0.0
+    # Use x_0 as the semantic-goal base.  GoalDetailCorruptor can then turn it
+    # into a fixed dream-like (for example blurred) condition independently of
+    # the current state's noise level.
+    goal_from_clean: bool = False
+    # Train a local transition from the current state instead of defining the
+    # answer relative to the goal: a=max(s-answer_jump, 0).
+    answer_from_current: bool = False
 
 
 @dataclass
@@ -135,9 +156,19 @@ class ModelConfig:
     fullres_dim: int = 320
     fullres_depth: int = 12
     fullres_cross_depth: int = 2
+    fullres_cross_gate_init: float = 1.0
     fullres_ffn_ratio: float = 2.0
     fullres_window_size: int = 8
     fullres_gradient_checkpointing: bool = True
+    fullres_random_attention: bool = False
+    fullres_random_slots: int = 64
+    fullres_random_dim: int = 64
+    fullres_random_temperature: float = 1.0
+    fullres_random_gate1_init: float = 0.02
+    fullres_random_gate2_init: float = 0.01
+    # Insert each random-attention layer immediately before the self block at
+    # the corresponding index. An empty list preserves the legacy [0, D//2].
+    fullres_random_positions: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -152,6 +183,14 @@ class LossConfig:
     paired_mean_weight: float = 1.0
     paired_deviation_weight: float = 1.0
     paired_variance_weight: float = 0.1
+    # Optional frozen ImageNet encoder supervision.  This operates on paired
+    # cloud features, including their sample-wise deviations, so it does not
+    # replace the full-resolution reconstruction objective.
+    perceptual_weight: float = 0.0
+    perceptual_pretrained: bool = True
+    perceptual_stages: list[int] = field(default_factory=lambda: [1, 2, 3, 5])
+    perceptual_mean_weight: float = 1.0
+    perceptual_deviation_weight: float = 1.0
     spatial_ce_weight: float = 0.0
     spatial_ce_highpass: bool = True
     spatial_ce_kernel_size: int = 5
@@ -161,6 +200,7 @@ class LossConfig:
 class TrainConfig:
     epochs: int = 20
     learning_rate: float = 3e-4
+    lr_schedule: str = "cosine"
     weight_decay: float = 1e-4
     grad_clip: float = 1.0
     amp: bool = True

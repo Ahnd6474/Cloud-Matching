@@ -11,9 +11,12 @@ from torch import Tensor
 from torch.utils.data import Dataset, Sampler
 
 from .data import BridgeBatch
+from .stateless import stateless_normal
 
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
+COMPACT_CLEAN_FORMAT_VERSION = 3
+SUPPORTED_FORMAT_VERSIONS = {1, 2, COMPACT_CLEAN_FORMAT_VERSION}
 IMAGE_KEYS = ("clean", "current", "goal", "target_cloud")
 LEVEL_KEYS = ("current_level", "goal_level", "answer_level")
 
@@ -73,10 +76,10 @@ class PreparedShardWriter:
                 ),
             }
             if self.save_target_noise:
-                if batch.target_noise is None:
-                    raise ValueError("target noise was requested but is unavailable")
-                record["target_noise"] = (
-                    batch.target_noise[index].detach().cpu().to(torch.float16)
+                if batch.target_noise_seed is None:
+                    raise ValueError("target noise seed was requested but is unavailable")
+                record["target_noise_seed"] = (
+                    batch.target_noise_seed[index].detach().cpu().to(torch.int64)
                 )
             self._records.append(record)
             if len(self._records) == self.shard_size:
@@ -91,6 +94,7 @@ class PreparedShardWriter:
             "storage": "uint8_-1_1",
             "length": self._total,
             "has_target_noise": self.save_target_noise,
+            "target_noise_storage": "seed" if self.save_target_noise else "none",
             "corruption_names": list(self.corruption_names),
             "shards": self._shards,
             **self.metadata,
@@ -126,8 +130,19 @@ class PreparedBridgeDataset(Dataset[dict[str, Tensor]]):
         self.manifest: dict[str, Any] = json.loads(
             manifest_path.read_text(encoding="utf-8")
         )
-        if self.manifest.get("format_version") != FORMAT_VERSION:
+        if self.manifest.get("format_version") not in SUPPORTED_FORMAT_VERSIONS:
             raise RuntimeError("unsupported prepared dataset format version")
+        self.target_cloud_storage = self.manifest.get(
+            "target_cloud_storage", "tensor"
+        )
+        if self.target_cloud_storage not in {"tensor", "clean_repeat"}:
+            raise RuntimeError("unsupported target cloud storage mode")
+        if self.target_cloud_storage == "clean_repeat":
+            target_samples = int(self.manifest.get("target_samples", 0))
+            if target_samples < 1:
+                raise RuntimeError(
+                    "clean-repeat storage requires a positive target_samples value"
+                )
         self.shards = self.manifest["shards"]
         self.ends: list[int] = []
         total = 0
@@ -155,15 +170,27 @@ class PreparedBridgeDataset(Dataset[dict[str, Tensor]]):
         start = 0 if shard_index == 0 else self.ends[shard_index - 1]
         payload = self._load_shard(shard_index)
         offset = index - start
+        stored_image_keys = (
+            IMAGE_KEYS[:3]
+            if self.target_cloud_storage == "clean_repeat"
+            else IMAGE_KEYS
+        )
         record = {
-            key: decode_image_tensor(payload[key][offset]) for key in IMAGE_KEYS
+            key: decode_image_tensor(payload[key][offset])
+            for key in stored_image_keys
         }
+        if self.target_cloud_storage == "clean_repeat":
+            record["target_cloud"] = record["clean"].unsqueeze(0).expand(
+                int(self.manifest["target_samples"]), -1, -1, -1
+            )
         record.update(
             {key: payload[key][offset].long() for key in LEVEL_KEYS}
         )
         record["corruption_type_id"] = payload["corruption_type_id"][offset].long()
         if "target_noise" in payload:
             record["target_noise"] = payload["target_noise"][offset].float()
+        if "target_noise_seed" in payload:
+            record["target_noise_seed"] = payload["target_noise_seed"][offset].long()
         return record
 
     def _load_shard(self, index: int) -> dict[str, Tensor]:
@@ -179,6 +206,30 @@ class PreparedBridgeDataset(Dataset[dict[str, Tensor]]):
         return payload
 
 
+def materialize_target_noise(
+    batch: dict[str, Tensor],
+    device: torch.device | str,
+    *,
+    dtype: torch.dtype = torch.float32,
+) -> Tensor | None:
+    """Load legacy tensor noise or reconstruct format-v2 noise from seeds."""
+    if "target_noise" in batch:
+        return batch["target_noise"].to(
+            device=device, dtype=dtype, non_blocking=True
+        )
+    if "target_noise_seed" not in batch:
+        return None
+    target_cloud = batch["target_cloud"]
+    if target_cloud.ndim != 5:
+        raise ValueError("a batched target cloud must have shape [B, S, C, H, W]")
+    return stateless_normal(
+        batch["target_noise_seed"],
+        target_cloud.shape[1:],
+        device=device,
+        dtype=dtype,
+    )
+
+
 class ShardBatchSampler(Sampler[list[int]]):
     """Shuffle records while keeping each batch inside one memory-mapped shard.
 
@@ -192,13 +243,21 @@ class ShardBatchSampler(Sampler[list[int]]):
         batch_size: int,
         drop_last: bool = False,
         seed: int = 0,
+        num_replicas: int = 1,
+        rank: int = 0,
     ) -> None:
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
+        if num_replicas < 1:
+            raise ValueError("num_replicas must be positive")
+        if rank < 0 or rank >= num_replicas:
+            raise ValueError("rank must be in [0, num_replicas)")
         self.dataset = dataset
         self.batch_size = batch_size
         self.drop_last = drop_last
         self.seed = seed
+        self.num_replicas = num_replicas
+        self.rank = rank
         self.epoch = 0
 
     def set_epoch(self, epoch: int) -> None:
@@ -208,6 +267,8 @@ class ShardBatchSampler(Sampler[list[int]]):
         generator = torch.Generator().manual_seed(self.seed + self.epoch)
         shard_order = torch.randperm(len(self.dataset.shards), generator=generator)
         starts = [0, *self.dataset.ends[:-1]]
+        global_batch_index = 0
+        usable_batches = (self._global_length() // self.num_replicas) * self.num_replicas
         for shard_index_tensor in shard_order:
             shard_index = int(shard_index_tensor)
             count = int(self.dataset.shards[shard_index]["count"])
@@ -217,9 +278,16 @@ class ShardBatchSampler(Sampler[list[int]]):
                 selection = local_order[offset : offset + self.batch_size]
                 if self.drop_last and len(selection) < self.batch_size:
                     continue
-                yield (selection + start).tolist()
+                if global_batch_index >= usable_batches:
+                    return
+                if global_batch_index % self.num_replicas == self.rank:
+                    yield (selection + start).tolist()
+                global_batch_index += 1
 
     def __len__(self) -> int:
+        return self._global_length() // self.num_replicas
+
+    def _global_length(self) -> int:
         if self.drop_last:
             return sum(
                 int(shard["count"]) // self.batch_size for shard in self.dataset.shards

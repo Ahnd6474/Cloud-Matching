@@ -16,7 +16,7 @@ import torch.nn.functional as F
 
 from stochastic_bridge.config import config_from_dict
 from stochastic_bridge.model import StochasticImageBridge
-from stochastic_bridge.prepared import PreparedBridgeDataset
+from stochastic_bridge.prepared import PreparedBridgeDataset, materialize_target_noise
 from stochastic_bridge.schedule import VPNoiseSchedule
 
 
@@ -132,8 +132,19 @@ def main() -> None:
         compare_clean = torch.stack([record["clean"] for record in records]).to(device)
         compare_current = torch.stack([record["current"] for record in records]).to(device)
         compare_goal = torch.stack([record["goal"] for record in records]).to(device)
-        compare_noise = torch.stack([record["target_noise"] for record in records]).to(device)
         compare_target = torch.stack([record["target_cloud"] for record in records]).to(device)
+        noise_batch = {"target_cloud": compare_target}
+        noise_key = (
+            "target_noise_seed"
+            if "target_noise_seed" in records[0]
+            else "target_noise"
+        )
+        noise_batch[noise_key] = torch.stack(
+            [record[noise_key] for record in records]
+        )
+        compare_noise = materialize_target_noise(noise_batch, device)
+        if compare_noise is None:
+            raise RuntimeError("comparison requires reconstructable target noise")
         with torch.inference_mode(), autocast_context(device):
             baseline_output = baseline_model(
                 compare_current,

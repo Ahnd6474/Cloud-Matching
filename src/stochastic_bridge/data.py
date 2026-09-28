@@ -7,6 +7,7 @@ from torch import Tensor, nn
 
 from .noise import CorruptionMixture
 from .schedule import VPNoiseSchedule
+from .stateless import stateless_normal
 
 
 @dataclass(frozen=True)
@@ -16,6 +17,7 @@ class BridgeBatch:
     goal: Tensor
     target_cloud: Tensor
     target_noise: Tensor | None
+    target_noise_seed: Tensor | None
     current_level: Tensor
     goal_level: Tensor
     answer_level: Tensor
@@ -29,11 +31,24 @@ def sample_level_triplet(
     device: torch.device | str | None = None,
     generator: torch.Generator | None = None,
     clean_answer_probability: float = 0.0,
+    goal_from_clean: bool = False,
+    answer_from_current: bool = False,
+    adaptive_answer_jump: bool = False,
+    near_clean_threshold: int = 20,
+    near_clean_answer_jump: int = 2,
+    near_clean_answer_jump_min: int = 0,
+    mid_clean_threshold: int = 50,
+    mid_clean_answer_jump: int = 5,
+    mid_clean_answer_jump_min: int = 0,
+    near_clean_probability: float = 0.0,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """Sample s > r and usually set a=max(r-answer_jump, 0).
+    """Sample current ``s``, goal ``r``, and answer ``a`` levels.
 
     ``s`` is the current/input corruption level, ``r`` is the image-goal
     corruption level, and ``a`` is the answer level requested by the user.
+    With ``goal_from_clean``, ``r=0`` and ``s`` is uniform over ``[1, T]``.
+    With ``answer_from_current``, ``a=max(s-answer_jump, 0)``; otherwise the
+    legacy bridge rule ``a=max(r-answer_jump, 0)`` is retained.
     ``clean_answer_probability`` adds direct arbitrary-state-to-x_0 examples.
     """
     if batch_size < 1:
@@ -44,21 +59,77 @@ def sample_level_triplet(
         raise ValueError("answer_jump must be positive")
     if not 0.0 <= clean_answer_probability <= 1.0:
         raise ValueError("clean_answer_probability must lie in [0, 1]")
+    if not 0.0 <= near_clean_probability <= 1.0:
+        raise ValueError("near_clean_probability must lie in [0, 1]")
+    if near_clean_threshold < 1 or mid_clean_threshold < near_clean_threshold:
+        raise ValueError("adaptive answer thresholds must be ordered and positive")
+    if min(near_clean_answer_jump, mid_clean_answer_jump) < 1:
+        raise ValueError("adaptive answer jumps must be positive")
+    near_jump_min = near_clean_answer_jump_min or near_clean_answer_jump
+    mid_jump_min = mid_clean_answer_jump_min or mid_clean_answer_jump
+    if not 1 <= near_jump_min <= near_clean_answer_jump:
+        raise ValueError("near-clean jump range is invalid")
+    if not 1 <= mid_jump_min <= mid_clean_answer_jump:
+        raise ValueError("mid-clean jump range is invalid")
 
-    goal_level = torch.randint(
-        0,
-        max_level,
-        (batch_size,),
-        device=device,
-        generator=generator,
-    )
+    if goal_from_clean:
+        goal_level = torch.zeros(batch_size, device=device, dtype=torch.long)
+    else:
+        goal_level = torch.randint(
+            0,
+            max_level,
+            (batch_size,),
+            device=device,
+            generator=generator,
+        )
     # Uniformly sample one integer from [goal+1, max_level] per item.
     span = max_level - goal_level
     offset = torch.floor(
         torch.rand(batch_size, device=device, generator=generator) * span
     ).long()
     current_level = goal_level + 1 + offset
-    answer_level = (goal_level - answer_jump).clamp_min(0)
+    if goal_from_clean and near_clean_probability > 0.0:
+        near_max = min(near_clean_threshold, max_level)
+        near_level = torch.randint(
+            1,
+            near_max + 1,
+            (batch_size,),
+            device=device,
+            generator=generator,
+        )
+        choose_near = (
+            torch.rand(batch_size, device=device, generator=generator)
+            < near_clean_probability
+        )
+        current_level = torch.where(choose_near, near_level, current_level)
+    answer_base = current_level if answer_from_current else goal_level
+    effective_jump = torch.full_like(answer_base, answer_jump)
+    if adaptive_answer_jump and answer_from_current:
+        mid_jump = torch.randint(
+            mid_jump_min,
+            mid_clean_answer_jump + 1,
+            (batch_size,),
+            device=device,
+            generator=generator,
+        )
+        near_jump = torch.randint(
+            near_jump_min,
+            near_clean_answer_jump + 1,
+            (batch_size,),
+            device=device,
+            generator=generator,
+        )
+        effective_jump = torch.where(
+            current_level <= mid_clean_threshold,
+            mid_jump,
+            effective_jump,
+        )
+        effective_jump = torch.where(
+            current_level <= near_clean_threshold,
+            near_jump,
+            effective_jump,
+        )
+    answer_level = (answer_base - effective_jump).clamp_min(0)
     if clean_answer_probability > 0.0:
         clean_answer = (
             torch.rand(batch_size, device=device, generator=generator)
@@ -81,6 +152,16 @@ def build_bridge_batch(
     clean_answer_probability: float = 0.0,
     endpoint_corruption_mixture: CorruptionMixture | None = None,
     endpoint_corruption_probability: float = 0.0,
+    goal_from_clean: bool = False,
+    answer_from_current: bool = False,
+    adaptive_answer_jump: bool = False,
+    near_clean_threshold: int = 20,
+    near_clean_answer_jump: int = 2,
+    near_clean_answer_jump_min: int = 0,
+    mid_clean_threshold: int = 50,
+    mid_clean_answer_jump: int = 5,
+    mid_clean_answer_jump_min: int = 0,
+    near_clean_probability: float = 0.0,
 ) -> BridgeBatch:
     """Construct current, image-goal, and cumulative answer cloud.
 
@@ -102,17 +183,33 @@ def build_bridge_batch(
         device=clean.device,
         generator=generator,
         clean_answer_probability=clean_answer_probability,
+        goal_from_clean=goal_from_clean,
+        answer_from_current=answer_from_current,
+        adaptive_answer_jump=adaptive_answer_jump,
+        near_clean_threshold=near_clean_threshold,
+        near_clean_answer_jump=near_clean_answer_jump,
+        near_clean_answer_jump_min=near_clean_answer_jump_min,
+        mid_clean_threshold=mid_clean_threshold,
+        mid_clean_answer_jump=mid_clean_answer_jump,
+        mid_clean_answer_jump_min=mid_clean_answer_jump_min,
+        near_clean_probability=near_clean_probability,
     )
     if not 0.0 <= endpoint_corruption_probability <= 1.0:
         raise ValueError("endpoint_corruption_probability must lie in [0, 1]")
     corruption_types: tuple[str, ...] | None = None
-    target_noise = torch.randn(
-        clean.shape[0],
-        target_samples,
-        *clean.shape[1:],
+    target_noise_seed = torch.randint(
+        0,
+        1 << 32,
+        (clean.shape[0],),
+        device=clean.device,
+        dtype=torch.int64,
+        generator=generator,
+    )
+    target_noise = stateless_normal(
+        target_noise_seed,
+        (target_samples, *clean.shape[1:]),
         device=clean.device,
         dtype=clean.dtype,
-        generator=generator,
     )
     if corruption_mixture is None:
         current_noise = torch.randn(
@@ -178,6 +275,7 @@ def build_bridge_batch(
         goal=goal,
         target_cloud=target_cloud,
         target_noise=target_noise,
+        target_noise_seed=target_noise_seed,
         current_level=current_level,
         goal_level=goal_level,
         answer_level=answer_level,

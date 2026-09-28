@@ -515,10 +515,44 @@ Or override both paths:
   --device cuda
 ```
 
+Multiple source datasets can be combined without copying their HR images into
+one directory. Repeat `--data` once per root; for example, DF2K uses 800 DIV2K
+training images plus 2,650 Flickr2K images:
+
+```bash
+python prepare_dataset.py \
+  --data /workspace/data/div2k/Dataset/DIV2K_train_HR \
+  --data /workspace/data/flickr2k/Flickr2K/Flickr2K_HR \
+  --output /workspace/data/prepared_df2k \
+  --device cuda
+```
+
+The same roots can be declared in YAML with `data.roots`. When it is non-empty,
+it takes precedence over the backward-compatible scalar `data.root`.
+
 The destination must be empty. It contains `manifest.json` plus numbered `.pt`
 shards. Image tensors are stored as uint8 and decoded to `[-1, 1]` while
-loading. `prepare.variants_per_image` controls how many independently cropped
-and corrupted records are generated from each source image.
+loading. Format v2 stores one uint32-compatible seed per paired record instead
+of its full FP16 Gaussian tensor; the exact cloud noise is reconstructed in a
+stateless batch operation on the training GPU. The loader remains compatible
+with format-v1 datasets that stored full noise tensors. `prepare.variants_per_image`
+controls how many independently cropped and corrupted records are generated
+from each source image.
+
+### Frozen lightweight feature encoder
+
+`EfficientNetB0Features` exposes ImageNet-pretrained EfficientNet-B0 stages for
+perceptual/content/texture losses. It consumes the bridge's `[-1, 1]` tensors
+without resizing and, for a 128x128 input, returns feature maps at 64, 32, 16,
+8, and 4 pixels. The classification head is omitted, all parameters are frozen,
+and BatchNorm remains in evaluation mode even when a parent loss is trained.
+
+```python
+from stochastic_bridge import EfficientNetB0Features
+
+encoder = EfficientNetB0Features(pretrained=True).cuda()
+features = encoder(images_128)
+```
 
 ## 2. Inspect generated training data
 

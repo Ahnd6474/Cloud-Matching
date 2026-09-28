@@ -293,28 +293,107 @@ class PairedMeanDeviationFullBandLoss(nn.Module):
         return self.components(predicted_cloud, target_cloud, current)[0]
 
 
-class EnergyCorrectionCloudLoss(nn.Module):
-    """Energy distance between implicit correction ensembles."""
+class PairedPerceptualCloudLoss(nn.Module):
+    """Match the mean and stochastic deviations of paired encoder features.
 
-    def __init__(self, feature_extractor: nn.Module | None = None) -> None:
+    The target branch is detached, while the frozen encoder remains in the
+    autograd path for predictions.  Consequently gradients reach the bridge
+    pixels without updating the pretrained feature extractor.
+    """
+
+    def __init__(
+        self,
+        feature_extractor: nn.Module,
+        mean_weight: float = 1.0,
+        deviation_weight: float = 1.0,
+    ) -> None:
+        super().__init__()
+        if mean_weight < 0.0 or deviation_weight < 0.0:
+            raise ValueError("perceptual weights must be non-negative")
+        if mean_weight + deviation_weight <= 0.0:
+            raise ValueError("at least one perceptual weight must be positive")
+        self.features = feature_extractor
+        self.mean_weight = mean_weight
+        self.deviation_weight = deviation_weight
+
+    def forward(self, predicted_cloud: Tensor, target_cloud: Tensor) -> Tensor:
+        if predicted_cloud.shape != target_cloud.shape:
+            raise ValueError("paired perceptual loss requires equal cloud shapes")
+        if predicted_cloud.ndim != 5:
+            raise ValueError("clouds must have shape [B,S,C,H,W]")
+        batch, samples = predicted_cloud.shape[:2]
+        with torch.no_grad():
+            target_features = self.features(target_cloud.flatten(0, 1))
+        predicted_features = self.features(predicted_cloud.flatten(0, 1))
+        if isinstance(predicted_features, Tensor):
+            predicted_features = (predicted_features,)
+            target_features = (target_features,)
+        if len(predicted_features) != len(target_features):
+            raise RuntimeError("feature extractor returned inconsistent stages")
+
+        mean_total = predicted_cloud.new_zeros((), dtype=torch.float32)
+        deviation_total = predicted_cloud.new_zeros((), dtype=torch.float32)
+        for predicted, target in zip(predicted_features, target_features, strict=True):
+            predicted = predicted.float().reshape(batch, samples, *predicted.shape[1:])
+            target = target.float().reshape(batch, samples, *target.shape[1:])
+            predicted_mean = predicted.mean(dim=1, keepdim=True)
+            target_mean = target.mean(dim=1, keepdim=True)
+            mean_total = mean_total + F.l1_loss(predicted_mean, target_mean)
+            deviation_total = deviation_total + F.l1_loss(
+                predicted - predicted_mean,
+                target - target_mean,
+            )
+        stages = max(len(predicted_features), 1)
+        return (
+            self.mean_weight * mean_total
+            + self.deviation_weight * deviation_total
+        ) / stages
+
+
+class EnergyCorrectionCloudLoss(nn.Module):
+    """Energy distance between implicit correction ensembles.
+
+    ``unbiased=False`` preserves the original V-statistic, whose self-distance
+    means include the zero diagonal.  ``unbiased=True`` uses the U-statistic
+    self terms, averaging only the ``S * (S - 1)`` off-diagonal distances.  The
+    latter removes the finite-cloud diversity-shrinkage bias, at the cost of a
+    noisier estimate that can be negative for an individual mini-batch.
+    """
+
+    def __init__(
+        self,
+        feature_extractor: nn.Module | None = None,
+        *,
+        unbiased: bool = False,
+    ) -> None:
         super().__init__()
         self.features = feature_extractor or MultiScaleCorrectionFeatures()
+        self.unbiased = unbiased
 
     def forward(self, predicted_cloud: Tensor, target_cloud: Tensor, current: Tensor) -> Tensor:
         current_features = self.features(current)
         predicted = _cloud_features(self.features, predicted_cloud) - current_features[:, None]
         target = _cloud_features(self.features, target_cloud) - current_features[:, None]
         cross = torch.cdist(predicted, target, p=2).mean(dim=(1, 2))
-        predicted_self = torch.cdist(predicted, predicted, p=2).mean(dim=(1, 2))
-        target_self = torch.cdist(target, target, p=2).mean(dim=(1, 2))
+        predicted_distances = torch.cdist(predicted, predicted, p=2)
+        target_distances = torch.cdist(target, target, p=2)
+        if self.unbiased:
+            predicted_self = _off_diagonal_mean(predicted_distances)
+            target_self = _off_diagonal_mean(target_distances)
+        else:
+            predicted_self = predicted_distances.mean(dim=(1, 2))
+            target_self = target_distances.mean(dim=(1, 2))
         return (2.0 * cross - predicted_self - target_self).mean()
 
 
 class FullBandEnergyCorrectionCloudLoss(EnergyCorrectionCloudLoss):
     """Energy distance that preserves pixel-scale detail via a Laplacian pyramid."""
 
-    def __init__(self, levels: int = 3) -> None:
-        super().__init__(feature_extractor=LaplacianCorrectionFeatures(levels))
+    def __init__(self, levels: int = 3, *, unbiased: bool = False) -> None:
+        super().__init__(
+            feature_extractor=LaplacianCorrectionFeatures(levels),
+            unbiased=unbiased,
+        )
 
 
 class SpatialNoiseCrossEntropyLoss(nn.Module):
@@ -406,6 +485,18 @@ def _cloud_features(features: nn.Module, cloud: Tensor) -> Tensor:
     return features(flat_cloud).reshape(batch, samples, -1)
 
 
+def _off_diagonal_mean(distances: Tensor) -> Tensor:
+    """Average square pairwise-distance matrices without their zero diagonal."""
+    if distances.ndim != 3 or distances.shape[1] != distances.shape[2]:
+        raise ValueError("self-distance tensor must have shape [B,S,S]")
+    samples = distances.shape[1]
+    if samples < 2:
+        raise ValueError("unbiased energy distance requires at least two samples")
+    # torch.cdist has an exact zero diagonal, so summing the full matrix while
+    # dividing by the off-diagonal count avoids allocating an SxS mask.
+    return distances.sum(dim=(1, 2)) / (samples * (samples - 1))
+
+
 def is_paired_cloud_loss(name: str) -> bool:
     return name.strip().lower() in {
         "paired",
@@ -447,11 +538,19 @@ def build_cloud_loss(
         )
     if normalized == "energy":
         return EnergyCorrectionCloudLoss()
+    if normalized == "energy_u":
+        return EnergyCorrectionCloudLoss(unbiased=True)
     if normalized == "energy_full_band":
         return FullBandEnergyCorrectionCloudLoss(levels=full_band_levels)
+    if normalized == "energy_full_band_u":
+        return FullBandEnergyCorrectionCloudLoss(
+            levels=full_band_levels,
+            unbiased=True,
+        )
     if normalized == "sinkhorn":
         return SinkhornCorrectionCloudLoss(blur=blur)
     raise ValueError(
         f"unknown loss '{name}'; choose paired, paired_full_band, "
-        "paired_mean_deviation_full_band, energy, energy_full_band, or sinkhorn"
+        "paired_mean_deviation_full_band, energy, energy_u, energy_full_band, "
+        "energy_full_band_u, or sinkhorn"
     )

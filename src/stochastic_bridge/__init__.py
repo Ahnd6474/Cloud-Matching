@@ -4,6 +4,7 @@ from .losses import (
     FullBandEnergyCorrectionCloudLoss,
     PairedFullBandCloudLoss,
     PairedMeanDeviationFullBandLoss,
+    PairedPerceptualCloudLoss,
     PairedCorrectionLoss,
     SpatialNoiseCrossEntropyLoss,
     SinkhornCorrectionCloudLoss,
@@ -12,15 +13,24 @@ from .losses import (
 )
 from .model import StochasticImageBridge
 from .noise import CorruptionMixture, SUPPORTED_CORRUPTIONS
-from .prepared import PreparedBridgeDataset, PreparedShardWriter, ShardBatchSampler
+from .perceptual import EfficientNetB0Features
+from .prepared import (
+    PreparedBridgeDataset,
+    PreparedShardWriter,
+    ShardBatchSampler,
+    materialize_target_noise,
+)
 from .schedule import VPNoiseSchedule
+from .stateless import stateless_normal
 
 __all__ = [
     "BridgeBatch",
     "EnergyCorrectionCloudLoss",
+    "EfficientNetB0Features",
     "FullBandEnergyCorrectionCloudLoss",
     "PairedFullBandCloudLoss",
     "PairedMeanDeviationFullBandLoss",
+    "PairedPerceptualCloudLoss",
     "PairedCorrectionLoss",
     "SpatialNoiseCrossEntropyLoss",
     "SinkhornCorrectionCloudLoss",
@@ -30,6 +40,8 @@ __all__ = [
     "PreparedBridgeDataset",
     "PreparedShardWriter",
     "ShardBatchSampler",
+    "materialize_target_noise",
+    "stateless_normal",
     "VPNoiseSchedule",
     "build_bridge_batch",
     "build_cloud_loss",

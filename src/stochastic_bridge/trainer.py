@@ -19,13 +19,15 @@ from .corruptions import GoalDetailCorruptor
 from .data import BridgeBatch, build_bridge_batch
 from .datasets import ImageDirectoryDataset, SyntheticImageDataset
 from .losses import (
+    PairedPerceptualCloudLoss,
     SpatialNoiseCrossEntropyLoss,
     build_cloud_loss,
     is_paired_cloud_loss,
 )
 from .model import StochasticImageBridge
 from .noise import CorruptionMixture
-from .prepared import PreparedBridgeDataset, ShardBatchSampler
+from .perceptual import EfficientNetB0Features
+from .prepared import PreparedBridgeDataset, ShardBatchSampler, materialize_target_noise
 from .schedule import VPNoiseSchedule
 
 
@@ -83,6 +85,18 @@ class Trainer:
             full_band_high_weight=config.loss.full_band_high_weight,
             full_band_low_weight=config.loss.full_band_low_weight,
         ).to(self.device)
+        self.perceptual_criterion = (
+            PairedPerceptualCloudLoss(
+                EfficientNetB0Features(
+                    pretrained=config.loss.perceptual_pretrained,
+                    stages=config.loss.perceptual_stages,
+                ),
+                mean_weight=config.loss.perceptual_mean_weight,
+                deviation_weight=config.loss.perceptual_deviation_weight,
+            ).to(self.device)
+            if config.loss.perceptual_weight > 0.0
+            else None
+        )
         self.spatial_criterion = (
             SpatialNoiseCrossEntropyLoss(
                 highpass=config.loss.spatial_ce_highpass,
@@ -147,6 +161,8 @@ class Trainer:
                     clean_answer_probability=(
                         self.config.schedule.clean_answer_probability
                     ),
+                    goal_from_clean=self.config.schedule.goal_from_clean,
+                    answer_from_current=self.config.schedule.answer_from_current,
                     endpoint_corruption_mixture=self.endpoint_corruption_mixture,
                     endpoint_corruption_probability=(
                         self.config.endpoint_corruption.probability
@@ -173,6 +189,11 @@ class Trainer:
                 cloud_loss = self.criterion(
                     predicted, bridge.target_cloud, bridge.current
                 )
+                perceptual_loss = cloud_loss.new_zeros(())
+                if self.perceptual_criterion is not None:
+                    perceptual_loss = self.perceptual_criterion(
+                        predicted, bridge.target_cloud
+                    )
                 spatial_loss = cloud_loss.new_zeros(())
                 if self.spatial_criterion is not None:
                     if len(model_output) != 3:
@@ -180,7 +201,11 @@ class Trainer:
                     spatial_loss = self.spatial_criterion(
                         model_output[2], bridge.target_cloud, bridge.current
                     )
-                loss = cloud_loss + self.config.loss.spatial_ce_weight * spatial_loss
+                loss = (
+                    cloud_loss
+                    + self.config.loss.perceptual_weight * perceptual_loss
+                    + self.config.loss.spatial_ce_weight * spatial_loss
+                )
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -197,6 +222,18 @@ class Trainer:
                 self.writer.add_scalar(
                     "train/cloud_loss", cloud_loss.detach().item(), self.global_step
                 )
+                if self.perceptual_criterion is not None:
+                    self.writer.add_scalar(
+                        "train/perceptual_loss",
+                        perceptual_loss.detach().item(),
+                        self.global_step,
+                    )
+                    self.writer.add_scalar(
+                        "train/perceptual_contribution",
+                        self.config.loss.perceptual_weight
+                        * perceptual_loss.detach().item(),
+                        self.global_step,
+                    )
                 if self.spatial_criterion is not None:
                     self.writer.add_scalar(
                         "train/spatial_ce", spatial_loss.detach().item(), self.global_step
@@ -241,7 +278,7 @@ class Trainer:
                 SyntheticImageDataset(data.synthetic_length, data.image_size)
                 if data.synthetic
                 else ImageDirectoryDataset(
-                    data.root,
+                    data.roots or data.root,
                     data.image_size,
                     random_crop=data.random_crop,
                     crop_mode=data.crop_mode,
@@ -304,8 +341,11 @@ class Trainer:
             goal=move("goal"),
             target_cloud=move("target_cloud"),
             target_noise=(
-                move("target_noise") if "target_noise" in raw else None
+                materialize_target_noise(raw, self.device)
+                if is_paired_cloud_loss(self.config.loss.name)
+                else None
             ),
+            target_noise_seed=None,
             current_level=move("current_level"),
             goal_level=move("goal_level"),
             answer_level=move("answer_level"),

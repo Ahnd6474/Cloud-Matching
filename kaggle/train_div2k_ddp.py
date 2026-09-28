@@ -14,19 +14,25 @@ import torch.distributed as dist
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader
 from torchvision.utils import make_grid
 from tqdm.auto import tqdm
 
 from stochastic_bridge.config import load_config
 from stochastic_bridge.losses import (
     PairedMeanDeviationFullBandLoss,
+    PairedPerceptualCloudLoss,
     SpatialNoiseCrossEntropyLoss,
     build_cloud_loss,
     is_paired_cloud_loss,
 )
 from stochastic_bridge.model import StochasticImageBridge
-from stochastic_bridge.prepared import PreparedBridgeDataset
+from stochastic_bridge.perceptual import EfficientNetB0Features
+from stochastic_bridge.prepared import (
+    PreparedBridgeDataset,
+    ShardBatchSampler,
+    materialize_target_noise,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -50,6 +56,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--max-train-batches", type=int, default=0)
     parser.add_argument("--max-val-batches", type=int, default=0)
+    parser.add_argument(
+        "--warmup-to-lr",
+        type=float,
+        default=0.0,
+        help="Linearly warm the resumed optimizer to this LR; 0 disables override",
+    )
+    parser.add_argument(
+        "--warmup-epochs",
+        type=float,
+        default=1.0,
+        help="Number of epochs used by --warmup-to-lr",
+    )
+    parser.add_argument(
+        "--fixed-lr",
+        type=float,
+        default=0.0,
+        help="LR held after override warmup; defaults to --warmup-to-lr",
+    )
     parser.add_argument(
         "--tensorboard-dir",
         default="",
@@ -128,8 +152,32 @@ def cloud_diversity(cloud: Tensor) -> Tensor:
     return cloud.detach().float().std(dim=1, unbiased=False).mean(dim=(1, 2, 3))
 
 
+def adamw_parameter_groups(model: nn.Module, weight_decay: float) -> list[dict[str, Any]]:
+    """Keep stochastic mixing gates free of AdamW's shrink-to-zero bias."""
+    regular: list[nn.Parameter] = []
+    gate_parameters: list[nn.Parameter] = []
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if (
+            ".random_attentions." in name and name.endswith(".gate")
+        ) or ".gate_projections." in name:
+            gate_parameters.append(parameter)
+        else:
+            regular.append(parameter)
+    groups: list[dict[str, Any]] = [
+        {"params": regular, "weight_decay": weight_decay}
+    ]
+    if gate_parameters:
+        groups.append({"params": gate_parameters, "weight_decay": 0.0})
+    return groups
+
+
 def move_batch(
-    raw: dict[str, Tensor], device: torch.device, channels_last: bool
+    raw: dict[str, Tensor],
+    device: torch.device,
+    channels_last: bool,
+    materialize_noise: bool,
 ) -> dict[str, Tensor]:
     moved: dict[str, Tensor] = {}
     for key in (
@@ -145,8 +193,11 @@ def move_batch(
         if channels_last and key in {"clean", "current", "goal"}:
             value = value.contiguous(memory_format=torch.channels_last)
         moved[key] = value
-    if "target_noise" in raw:
-        moved["target_noise"] = raw["target_noise"].to(device, non_blocking=True)
+    if materialize_noise:
+        target_noise = materialize_target_noise(raw, device)
+        if target_noise is None:
+            raise RuntimeError("paired training requires reconstructable target noise")
+        moved["target_noise"] = target_noise
     return moved
 
 
@@ -212,6 +263,8 @@ def validate(
     model: nn.Module,
     loader: DataLoader,
     criterion: nn.Module,
+    perceptual_criterion: PairedPerceptualCloudLoss | None,
+    perceptual_weight: float,
     spatial_criterion: SpatialNoiseCrossEntropyLoss | None,
     spatial_ce_weight: float,
     paired: bool,
@@ -227,12 +280,12 @@ def validate(
     model.eval()
     # loss, input/output PSNR, mean energy, count, cloud/spatial loss,
     # and per-image spatial-energy p50/p95/p99/max.
-    totals = torch.zeros(24, device=device)
+    totals = torch.zeros(25, device=device)
     energy_quantile_levels = torch.tensor([0.50, 0.95, 0.99], device=device)
     for batch_index, raw in enumerate(loader):
         if max_batches and batch_index >= max_batches:
             break
-        batch = move_batch(raw, device, channels_last)
+        batch = move_batch(raw, device, channels_last, paired)
         with torch.autocast(
             device_type=device.type,
             dtype=torch.float16,
@@ -256,12 +309,21 @@ def validate(
                 criterion,
                 predicted, batch["target_cloud"], batch["current"]
             )
+            perceptual_loss = cloud_loss.new_zeros(())
+            if perceptual_criterion is not None:
+                perceptual_loss = perceptual_criterion(
+                    predicted, batch["target_cloud"]
+                )
             spatial_loss = cloud_loss.new_zeros(())
             if spatial_criterion is not None:
                 spatial_loss = spatial_criterion(
                     model_output[2], batch["target_cloud"], batch["current"]
                 )
-            loss = cloud_loss + spatial_ce_weight * spatial_loss
+            loss = (
+                cloud_loss
+                + perceptual_weight * perceptual_loss
+                + spatial_ce_weight * spatial_loss
+            )
         if batch_index == 0 and writer is not None and validation_images > 0:
             log_validation_images(
                 writer,
@@ -317,6 +379,7 @@ def validate(
                 target_diversity[transition_endpoint].sum(),
                 energy_per_image[transition_endpoint].sum(),
                 transition_count.float(),
+                perceptual_loss.float() * count,
             ],
         )
     model.train()
@@ -348,6 +411,7 @@ def validate(
         / transition_denominator,
         "val_transition_noise_variance": totals[22].item()
         / transition_denominator,
+        "val_perceptual_loss": totals[24].item() / denominator,
     }
 
 
@@ -408,20 +472,21 @@ def main() -> None:
     paired = is_paired_cloud_loss(config.loss.name)
     for dataset in (train_dataset, val_dataset):
         if paired and not dataset.has_target_noise:
-            raise RuntimeError("Gaussian paired training requires stored target_noise")
+            raise RuntimeError(
+                "Gaussian paired training requires reconstructable target noise"
+            )
         if int(dataset.manifest["target_samples"]) != config.loss.samples:
             raise RuntimeError("prepared target_samples does not match config")
 
-    train_sampler = DistributedSampler(
+    train_batch_sampler = ShardBatchSampler(
         train_dataset,
+        batch_size=config.data.batch_size,
+        drop_last=True,
+        seed=config.train.seed,
         num_replicas=world_size,
         rank=rank,
-        shuffle=True,
-        seed=config.train.seed,
-        drop_last=True,
     )
     loader_kwargs: dict[str, Any] = {
-        "batch_size": config.data.batch_size,
         "num_workers": config.data.workers,
         "pin_memory": device.type == "cuda",
         "persistent_workers": config.data.workers > 0,
@@ -430,12 +495,17 @@ def main() -> None:
         loader_kwargs["prefetch_factor"] = config.data.prefetch_factor
     train_loader = DataLoader(
         train_dataset,
-        sampler=train_sampler,
-        drop_last=True,
+        batch_sampler=train_batch_sampler,
         **loader_kwargs,
     )
     val_loader = (
-        DataLoader(val_dataset, shuffle=False, drop_last=False, **loader_kwargs)
+        DataLoader(
+            val_dataset,
+            batch_size=config.data.batch_size,
+            shuffle=False,
+            drop_last=False,
+            **loader_kwargs,
+        )
         if is_main
         else None
     )
@@ -462,6 +532,12 @@ def main() -> None:
             static_graph=True,
             **ddp_device,
         )
+    if config.train.compile:
+        train_model = torch.compile(
+            train_model,
+            mode=config.train.compile_mode,
+            fullgraph=False,
+        )
     criterion = build_cloud_loss(
         config.loss.name,
         blur=config.loss.sinkhorn_blur,
@@ -473,6 +549,18 @@ def main() -> None:
         paired_deviation_weight=config.loss.paired_deviation_weight,
         paired_variance_weight=config.loss.paired_variance_weight,
     ).to(device)
+    perceptual_criterion = (
+        PairedPerceptualCloudLoss(
+            EfficientNetB0Features(
+                pretrained=config.loss.perceptual_pretrained,
+                stages=config.loss.perceptual_stages,
+            ),
+            mean_weight=config.loss.perceptual_mean_weight,
+            deviation_weight=config.loss.perceptual_deviation_weight,
+        ).to(device)
+        if config.loss.perceptual_weight > 0.0
+        else None
+    )
     spatial_criterion = (
         SpatialNoiseCrossEntropyLoss(
             highpass=config.loss.spatial_ce_highpass,
@@ -486,14 +574,19 @@ def main() -> None:
             "loss.spatial_ce_weight requires model.architecture=fullres_axial"
         )
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        adamw_parameter_groups(model, config.train.weight_decay),
         lr=config.train.learning_rate,
-        weight_decay=config.train.weight_decay,
         fused=config.train.fused_optimizer and device.type == "cuda",
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max(config.train.epochs, 1)
-    )
+    schedule_name = config.train.lr_schedule.strip().lower()
+    if schedule_name == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max(config.train.epochs, 1)
+        )
+    elif schedule_name == "fixed":
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+    else:
+        raise ValueError("train.lr_schedule must be 'cosine' or 'fixed'")
     amp_enabled = config.train.amp and device.type == "cuda"
     scaler = torch.amp.GradScaler(
         "cuda",
@@ -509,8 +602,46 @@ def main() -> None:
         raise ValueError("--resume and --init-checkpoint are mutually exclusive")
     if args.init_checkpoint:
         state = torch.load(args.init_checkpoint, map_location=device, weights_only=False)
-        model.load_state_dict(state["model"])
         source_model_config = state.get("config", {}).get("model", {})
+        source_random_attention = bool(
+            source_model_config.get("fullres_random_attention", False)
+        )
+        adding_random_attention = (
+            config.model.architecture == "fullres_axial"
+            and config.model.fullres_random_attention
+            and not source_random_attention
+        )
+        incompatible = model.load_state_dict(state["model"], strict=False)
+        allowed_missing_prefixes = ["fullres.cross_blocks."]
+        if adding_random_attention:
+            allowed_missing_prefixes.append("fullres.random_attentions.")
+        invalid_missing = [
+            name
+            for name in incompatible.missing_keys
+            if not (
+                name.endswith("gate_projections.0.weight")
+                or name.endswith("gate_projections.0.bias")
+                or name.endswith("gate_projections.1.weight")
+                or name.endswith("gate_projections.1.bias")
+                or name.endswith("gate_projections.2.weight")
+                or name.endswith("gate_projections.2.bias")
+                or any(name.startswith(prefix) for prefix in allowed_missing_prefixes[1:])
+            )
+        ]
+        unexpected = list(incompatible.unexpected_keys)
+        if unexpected or invalid_missing:
+            raise RuntimeError(
+                "checkpoint mismatch outside newly added attention gates: "
+                f"missing={invalid_missing}, unexpected={unexpected}"
+            )
+        if adding_random_attention:
+            if is_main:
+                print(
+                    "initialized two new random-attention layers while loading "
+                    "all compatible checkpoint weights"
+                )
+        if is_main and any("gate_projections" in name for name in incompatible.missing_keys):
+            print("initialized learned cross-attention gates from the new config")
         source_energy_parameterization = source_model_config.get(
             "noise_energy_parameterization", "bounded"
         )
@@ -546,6 +677,26 @@ def main() -> None:
         start_epoch = int(state.get("epoch", 0))
         best_val = min((row["val_loss"] for row in history), default=math.inf)
 
+    lr_override = args.warmup_to_lr > 0.0
+    if lr_override:
+        if not resume:
+            raise ValueError("--warmup-to-lr requires --resume")
+        if args.warmup_epochs <= 0.0:
+            raise ValueError("--warmup-epochs must be positive")
+        fixed_lr = args.fixed_lr or args.warmup_to_lr
+        if fixed_lr <= 0.0:
+            raise ValueError("--fixed-lr must be positive")
+        override_start_lr = float(optimizer.param_groups[0]["lr"])
+        override_start_step = start_epoch * len(train_loader)
+        override_warmup_steps = max(
+            1, round(args.warmup_epochs * len(train_loader))
+        )
+    else:
+        fixed_lr = 0.0
+        override_start_lr = 0.0
+        override_start_step = 0
+        override_warmup_steps = 0
+
     writer = None
     if is_main:
         tensorboard_dir = (
@@ -555,11 +706,30 @@ def main() -> None:
         )
         writer = SummaryWriter(log_dir=tensorboard_dir)
         writer.add_text("run/config", json.dumps(config.to_dict(), indent=2), 0)
+        if lr_override:
+            override_metadata = {
+                "resume_epoch": start_epoch,
+                "start_lr": override_start_lr,
+                "warmup_to_lr": args.warmup_to_lr,
+                "warmup_epochs": args.warmup_epochs,
+                "warmup_steps": override_warmup_steps,
+                "fixed_lr": fixed_lr,
+                "tensorboard_dir": str(tensorboard_dir),
+            }
+            (output / "lr_override.json").write_text(
+                json.dumps(override_metadata, indent=2), encoding="utf-8"
+            )
+            writer.add_text(
+                "run/lr_override",
+                json.dumps(override_metadata, indent=2),
+                global_step=override_start_step,
+            )
+            print(f"learning-rate override: {json.dumps(override_metadata)}")
 
     for epoch in range(start_epoch, config.train.epochs):
-        train_sampler.set_epoch(epoch)
+        train_batch_sampler.set_epoch(epoch)
         train_model.train()
-        totals = torch.zeros(12, device=device)
+        totals = torch.zeros(13, device=device)
         progress = tqdm(
             train_loader,
             desc=f"epoch {epoch + 1}/{config.train.epochs}",
@@ -568,8 +738,25 @@ def main() -> None:
         for batch_index, raw in enumerate(progress):
             if args.max_train_batches and batch_index >= args.max_train_batches:
                 break
+            if lr_override:
+                absolute_step = epoch * len(train_loader) + batch_index
+                warmup_progress = min(
+                    max(
+                        (absolute_step - override_start_step + 1)
+                        / override_warmup_steps,
+                        0.0,
+                    ),
+                    1.0,
+                )
+                step_lr = override_start_lr + warmup_progress * (
+                    args.warmup_to_lr - override_start_lr
+                )
+                if warmup_progress >= 1.0:
+                    step_lr = fixed_lr
+                for group in optimizer.param_groups:
+                    group["lr"] = step_lr
             optimizer.zero_grad(set_to_none=True)
-            batch = move_batch(raw, device, channels_last)
+            batch = move_batch(raw, device, channels_last, paired)
             with torch.autocast(
                 device_type=device.type,
                 dtype=torch.float16,
@@ -590,12 +777,21 @@ def main() -> None:
                     criterion,
                     predicted, batch["target_cloud"], batch["current"]
                 )
+                perceptual_loss = cloud_loss.new_zeros(())
+                if perceptual_criterion is not None:
+                    perceptual_loss = perceptual_criterion(
+                        predicted, batch["target_cloud"]
+                    )
                 spatial_loss = cloud_loss.new_zeros(())
                 if spatial_criterion is not None:
                     spatial_loss = spatial_criterion(
                         model_output[2], batch["target_cloud"], batch["current"]
                     )
-                loss = cloud_loss + config.loss.spatial_ce_weight * spatial_loss
+                loss = (
+                    cloud_loss
+                    + config.loss.perceptual_weight * perceptual_loss
+                    + config.loss.spatial_ce_weight * spatial_loss
+                )
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -623,6 +819,7 @@ def main() -> None:
                     variance_loss.detach().float() * count,
                     predicted_diversity.sum(),
                     target_diversity.sum(),
+                    perceptual_loss.detach().float() * count,
                 ]
             )
             if is_main and (batch_index + 1) % config.train.log_every == 0:
@@ -632,6 +829,16 @@ def main() -> None:
                 writer.add_scalar("batch/train_loss", loss.item(), global_step)
                 writer.add_scalar(
                     "batch/train_cloud_loss", cloud_loss.item(), global_step
+                )
+                writer.add_scalar(
+                    "batch/train_perceptual_loss",
+                    perceptual_loss.item(),
+                    global_step,
+                )
+                writer.add_scalar(
+                    "batch/train_perceptual_contribution",
+                    config.loss.perceptual_weight * perceptual_loss.item(),
+                    global_step,
                 )
                 writer.add_scalar(
                     "batch/train_spatial_ce", spatial_loss.item(), global_step
@@ -656,6 +863,35 @@ def main() -> None:
                 writer.add_scalar(
                     "batch/noise_variance", noise_variance.float().mean().item(), global_step
                 )
+                if (
+                    model.architecture == "fullres_axial"
+                    and model.fullres.random_attention_enabled
+                ):
+                    for index, random_layer in enumerate(
+                        model.fullres.random_attentions, start=1
+                    ):
+                        writer.add_scalar(
+                            f"batch/random_gate_{index}",
+                            random_layer.gate.detach().float().item(),
+                            global_step,
+                        )
+                if model.architecture == "fullres_axial":
+                    for block_index, cross_block in enumerate(
+                        model.fullres.cross_blocks, start=1
+                    ):
+                        for gate_index, projection in enumerate(
+                            cross_block.gate_projections, start=1
+                        ):
+                            writer.add_scalar(
+                                f"batch/cross_gate_{block_index}_{gate_index}_bias_open",
+                                torch.sigmoid(projection.bias.detach().float()).mean().item(),
+                                global_step,
+                            )
+                            writer.add_scalar(
+                                f"batch/cross_gate_{block_index}_{gate_index}_weight_rms",
+                                projection.weight.detach().float().square().mean().sqrt().item(),
+                                global_step,
+                            )
                 writer.add_scalar("batch/gradient_norm", grad_norm.item(), global_step)
                 writer.add_scalar(
                     "batch/learning_rate", optimizer.param_groups[0]["lr"], global_step
@@ -676,11 +912,37 @@ def main() -> None:
             "train_paired_variance_loss": totals[9].item() / count,
             "train_predicted_diversity": totals[10].item() / count,
             "train_target_diversity": totals[11].item() / count,
+            "train_perceptual_loss": totals[12].item() / count,
             "learning_rate": optimizer.param_groups[0]["lr"],
         }
+        if (
+            model.architecture == "fullres_axial"
+            and model.fullres.random_attention_enabled
+        ):
+            for index, random_layer in enumerate(
+                model.fullres.random_attentions, start=1
+            ):
+                metrics[f"random_gate_{index}"] = (
+                    random_layer.gate.detach().float().item()
+                )
+        if model.architecture == "fullres_axial":
+            for block_index, cross_block in enumerate(
+                model.fullres.cross_blocks, start=1
+            ):
+                for gate_index, projection in enumerate(
+                    cross_block.gate_projections, start=1
+                ):
+                    prefix = f"cross_gate_{block_index}_{gate_index}"
+                    metrics[f"{prefix}_bias_open"] = (
+                        torch.sigmoid(projection.bias.detach().float()).mean().item()
+                    )
+                    metrics[f"{prefix}_weight_rms"] = (
+                        projection.weight.detach().float().square().mean().sqrt().item()
+                    )
         # Advance before checkpointing so a resumed run uses the exact next-
         # epoch learning rate rather than repeating the previous scheduler step.
-        scheduler.step()
+        if not lr_override:
+            scheduler.step()
 
         if world_size > 1:
             dist.barrier()
@@ -691,6 +953,8 @@ def main() -> None:
                     model,
                     val_loader,
                     criterion,
+                    perceptual_criterion,
+                    config.loss.perceptual_weight,
                     spatial_criterion,
                     config.loss.spatial_ce_weight,
                     paired,

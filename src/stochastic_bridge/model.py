@@ -308,7 +308,7 @@ def _partition_windows(
     tokens: Tensor,
     window_size: int,
     shift: int,
-) -> tuple[Tensor, Tensor, tuple[int, int, int, int, int]]:
+) -> tuple[Tensor, Tensor | None, tuple[int, int, int, int, int]]:
     """Partition a channels-last image without cyclic boundary wrapping."""
     batch, height, width, dim = tokens.shape
     top = shift
@@ -333,24 +333,27 @@ def _partition_windows(
         .reshape(-1, window_size * window_size, dim)
     )
 
-    valid = torch.ones(
-        (batch, 1, height, width), device=tokens.device, dtype=torch.bool
-    )
-    valid = F.pad(valid, (left, right, top, bottom), value=False)
-    valid_windows = (
-        valid.reshape(
-            batch,
-            1,
-            padded_height // window_size,
-            window_size,
-            padded_width // window_size,
-            window_size,
+    padding_mask = None
+    if any((left, right, top, bottom)):
+        valid = torch.ones(
+            (batch, 1, height, width), device=tokens.device, dtype=torch.bool
         )
-        .permute(0, 2, 4, 3, 5, 1)
-        .reshape(-1, window_size * window_size)
-    )
+        valid = F.pad(valid, (left, right, top, bottom), value=False)
+        valid_windows = (
+            valid.reshape(
+                batch,
+                1,
+                padded_height // window_size,
+                window_size,
+                padded_width // window_size,
+                window_size,
+            )
+            .permute(0, 2, 4, 3, 5, 1)
+            .reshape(-1, window_size * window_size)
+        )
+        padding_mask = ~valid_windows
     metadata = (height, width, padded_height, padded_width, shift)
-    return windows, ~valid_windows, metadata
+    return windows, padding_mask, metadata
 
 
 def _reverse_windows(
@@ -398,6 +401,7 @@ class FactorizedAttention2d(nn.Module):
         self.attention = nn.MultiheadAttention(dim, heads, batch_first=True)
 
     def forward(self, query: Tensor, context: Tensor | None = None) -> Tensor:
+        self_attention = context is None
         context = query if context is None else context
         if query.shape != context.shape or query.ndim != 4:
             raise ValueError("attention tensors must share [B,H,W,D] shape")
@@ -416,9 +420,12 @@ class FactorizedAttention2d(nn.Module):
         q_windows, padding_mask, metadata = _partition_windows(
             query, self.window_size, self.shift
         )
-        kv_windows, _, context_metadata = _partition_windows(
-            context, self.window_size, self.shift
-        )
+        if self_attention:
+            kv_windows, context_metadata = q_windows, metadata
+        else:
+            kv_windows, _, context_metadata = _partition_windows(
+                context, self.window_size, self.shift
+            )
         if metadata != context_metadata:
             raise RuntimeError("query and context window layouts differ")
         result, _ = self.attention(
@@ -441,8 +448,11 @@ class FullResolutionCrossBlock(nn.Module):
         window_size: int,
         ffn_ratio: float,
         shifted: bool,
+        gate_init: float,
     ) -> None:
         super().__init__()
+        if not 0.0 < gate_init <= 1.0:
+            raise ValueError("fullres_cross_gate_init must lie in (0, 1]")
         hidden = max(dim, round(dim * ffn_ratio))
         self.query_norms = nn.ModuleList([nn.LayerNorm(dim) for _ in range(3)])
         self.context_norms = nn.ModuleList([nn.LayerNorm(dim) for _ in range(3)])
@@ -455,6 +465,15 @@ class FullResolutionCrossBlock(nn.Module):
                 FactorizedAttention2d(dim, heads, "column"),
             ]
         )
+        self.gate_projections = nn.ModuleList(
+            [nn.Linear(dim, 1) for _ in range(3)]
+        )
+        gate_logit = 12.0 if gate_init == 1.0 else math.log(
+            gate_init / (1.0 - gate_init)
+        )
+        for projection in self.gate_projections:
+            nn.init.zeros_(projection.weight)
+            nn.init.constant_(projection.bias, gate_logit)
         self.ff = nn.Sequential(
             nn.LayerNorm(dim),
             nn.Linear(dim, hidden),
@@ -463,13 +482,16 @@ class FullResolutionCrossBlock(nn.Module):
         )
 
     def forward(self, current: Tensor, goal: Tensor) -> Tensor:
-        for query_norm, context_norm, attention in zip(
+        for query_norm, context_norm, attention, gate_projection in zip(
             self.query_norms,
             self.context_norms,
             self.attentions,
+            self.gate_projections,
             strict=True,
         ):
-            current = current + attention(query_norm(current), context_norm(goal))
+            update = attention(query_norm(current), context_norm(goal))
+            gate = torch.sigmoid(gate_projection(update))
+            current = current + gate * update
         return current + self.ff(current)
 
 
@@ -507,6 +529,80 @@ class FullResolutionMixerBlock(nn.Module):
         return tokens + self.ff(tokens)
 
 
+class FullResolutionRandomAttention(nn.Module):
+    """Let full-resolution queries select from an independent random KV memory."""
+
+    def __init__(
+        self,
+        dim: int,
+        heads: int,
+        random_dim: int,
+        temperature: float,
+        gate_init: float,
+    ) -> None:
+        super().__init__()
+        if dim % heads:
+            raise ValueError("random-attention dimension must be divisible by heads")
+        if random_dim < 1:
+            raise ValueError("random_dim must be positive")
+        if temperature <= 0.0:
+            raise ValueError("random-attention temperature must be positive")
+        self.dim = dim
+        self.heads = heads
+        self.head_dim = dim // heads
+        self.random_dim = random_dim
+        self.temperature = temperature
+        self.query_norm = nn.LayerNorm(dim)
+        self.query_projection = nn.Linear(dim, dim, bias=False)
+        # K and V deliberately use separate learned projections of the same Z.
+        self.key_projection = nn.Linear(random_dim, dim, bias=False)
+        self.value_projection = nn.Linear(random_dim, dim, bias=False)
+        self.key_norm = nn.LayerNorm(dim, elementwise_affine=False)
+        self.value_norm = nn.LayerNorm(dim, elementwise_affine=False)
+        self.output_projection = nn.Linear(dim, dim, bias=False)
+        self.gate = nn.Parameter(torch.tensor(float(gate_init)))
+
+    def forward(self, query: Tensor, random_tokens: Tensor) -> Tensor:
+        if query.ndim != 4:
+            raise ValueError("query must have shape [B,H,W,C]")
+        if random_tokens.ndim != 3:
+            raise ValueError("random_tokens must have shape [B,M,R]")
+        batch, height, width, dim = query.shape
+        if dim != self.dim:
+            raise ValueError(f"query feature dimension must be {self.dim}")
+        if random_tokens.shape[0] != batch:
+            raise ValueError("query and random memory batch sizes must match")
+        if random_tokens.shape[-1] != self.random_dim:
+            raise ValueError(
+                f"random token dimension must be {self.random_dim}"
+            )
+
+        query_flat = self.query_projection(self.query_norm(query)).reshape(
+            batch, height * width, self.heads, self.head_dim
+        )
+        key = self.key_norm(self.key_projection(random_tokens)).reshape(
+            batch, random_tokens.shape[1], self.heads, self.head_dim
+        )
+        value = self.value_norm(self.value_projection(random_tokens)).reshape(
+            batch, random_tokens.shape[1], self.heads, self.head_dim
+        )
+        query_flat = query_flat.permute(0, 2, 1, 3) / self.temperature
+        key = key.permute(0, 2, 1, 3)
+        value = value.permute(0, 2, 1, 3)
+        attended = F.scaled_dot_product_attention(
+            query_flat,
+            key,
+            value,
+            dropout_p=0.0,
+            is_causal=False,
+        )
+        attended = (
+            attended.permute(0, 2, 1, 3)
+            .reshape(batch, height, width, dim)
+        )
+        return query + self.gate * self.output_projection(attended)
+
+
 class FullResolutionAxialCore(nn.Module):
     """Pixel-token bridge with dense cross fusion and factorized self attention."""
 
@@ -517,6 +613,7 @@ class FullResolutionAxialCore(nn.Module):
         heads: int,
         depth: int,
         cross_depth: int,
+        cross_gate_init: float,
         ffn_ratio: float,
         window_size: int,
         max_residual: float,
@@ -526,6 +623,13 @@ class FullResolutionAxialCore(nn.Module):
         noise_energy_parameterization: str,
         noise_amplitude_safety_max: float,
         gradient_checkpointing: bool,
+        random_attention: bool,
+        random_slots: int,
+        random_dim: int,
+        random_temperature: float,
+        random_gate1_init: float,
+        random_gate2_init: float,
+        random_positions: list[int] | tuple[int, ...],
     ) -> None:
         super().__init__()
         if dim % heads:
@@ -536,6 +640,17 @@ class FullResolutionAxialCore(nn.Module):
             raise ValueError("full-resolution depths must be positive")
         if ffn_ratio <= 0.0:
             raise ValueError("fullres_ffn_ratio must be positive")
+        if random_attention and depth < 4:
+            raise ValueError(
+                "fullres random attention requires depth >= 4 so both random "
+                "layers are followed by local and axial refinement"
+            )
+        if random_slots < 1:
+            raise ValueError("fullres_random_slots must be positive")
+        if random_dim < 1:
+            raise ValueError("fullres_random_dim must be positive")
+        if random_temperature <= 0.0:
+            raise ValueError("fullres_random_temperature must be positive")
         self.in_channels = in_channels
         self.dim = dim
         self.max_residual = max_residual
@@ -544,6 +659,20 @@ class FullResolutionAxialCore(nn.Module):
         self.noise_energy_parameterization = noise_energy_parameterization
         self.noise_amplitude_safety_max = noise_amplitude_safety_max
         self.gradient_checkpointing = gradient_checkpointing
+        self.random_attention_enabled = random_attention
+        self.random_slots = random_slots
+        self.random_dim = random_dim
+        if random_positions:
+            if len(random_positions) != 2:
+                raise ValueError("fullres_random_positions must contain two indices")
+            positions = tuple(int(value) for value in random_positions)
+        else:
+            positions = (0, depth // 2)
+        if positions[0] < 0 or positions[1] < positions[0] or positions[1] > depth:
+            raise ValueError(
+                "fullres_random_positions must be ordered within [0, fullres_depth]"
+            )
+        self.random_positions = positions
         self.pixel_embed = nn.Linear(in_channels, dim)
         self.cross_blocks = nn.ModuleList(
             [
@@ -553,6 +682,7 @@ class FullResolutionAxialCore(nn.Module):
                     window_size,
                     ffn_ratio,
                     shifted=bool(index % 2),
+                    gate_init=cross_gate_init,
                 )
                 for index in range(cross_depth)
             ]
@@ -571,6 +701,26 @@ class FullResolutionAxialCore(nn.Module):
                 for index in range(depth)
             ]
         )
+        self.random_attentions = nn.ModuleList()
+        if self.random_attention_enabled:
+            self.random_attentions.extend(
+                [
+                    FullResolutionRandomAttention(
+                        dim,
+                        heads,
+                        random_dim,
+                        random_temperature,
+                        random_gate1_init,
+                    ),
+                    FullResolutionRandomAttention(
+                        dim,
+                        heads,
+                        random_dim,
+                        random_temperature,
+                        random_gate2_init,
+                    ),
+                ]
+            )
         self.energy_norm = nn.LayerNorm(dim)
         self.energy_head = nn.Linear(dim, 1)
         self.reset_energy_head(noise_energy_init)
@@ -680,6 +830,48 @@ class FullResolutionAxialCore(nn.Module):
             f"noise channels must be {self.in_channels} or {dim}, got {channels}"
         )
 
+    def _random_memories(
+        self,
+        condition: Tensor,
+        samples: int,
+        noise: Tensor | None,
+    ) -> tuple[Tensor, Tensor]:
+        """Create independent Z memories, deterministically from supplied noise."""
+        batch = condition.shape[0]
+        needed = self.random_slots * self.random_dim
+        if noise is None:
+            memories = torch.randn(
+                batch,
+                samples,
+                2,
+                self.random_slots,
+                self.random_dim,
+                device=condition.device,
+                dtype=condition.dtype,
+            )
+        else:
+            if noise.ndim != 5 or noise.shape[:2] != (batch, samples):
+                raise ValueError("noise must have shape [B,samples,C,H,W]")
+            flat = noise.flatten(2)
+            total = 2 * needed
+            if flat.shape[-1] < total:
+                repeats = math.ceil(total / flat.shape[-1])
+                flat = flat.repeat(1, 1, repeats)
+            memories = flat[..., :total].reshape(
+                batch,
+                samples,
+                2,
+                self.random_slots,
+                self.random_dim,
+            )
+        first = memories[:, :, 0].reshape(
+            batch * samples, self.random_slots, self.random_dim
+        )
+        second = memories[:, :, 1].reshape(
+            batch * samples, self.random_slots, self.random_dim
+        )
+        return first, second
+
     def decode(
         self,
         condition: Tensor,
@@ -689,12 +881,48 @@ class FullResolutionAxialCore(nn.Module):
     ) -> tuple[Tensor, Tensor]:
         batch, height, width, dim = condition.shape
         energy = self.spatial_energy(condition)
-        latent = self._latent_noise(condition, samples, noise)
-        # ``energy`` is total expected feature-vector energy at a pixel.
-        latent = latent * (energy / dim).sqrt()[:, None, :, :, None]
-        tokens = condition[:, None].expand(-1, samples, -1, -1, -1) + latent
-        tokens = tokens.reshape(batch * samples, height, width, dim)
-        for block in self.blocks:
+        expanded_condition = condition[:, None].expand(
+            -1, samples, -1, -1, -1
+        )
+        if self.random_attention_enabled:
+            first_memory, second_memory = self._random_memories(
+                condition, samples, noise
+            )
+            tokens = expanded_condition.reshape(
+                batch * samples, height, width, dim
+            )
+            random_memories = (first_memory, second_memory)
+        else:
+            latent = self._latent_noise(condition, samples, noise)
+            # ``energy`` is total expected feature-vector energy at a pixel.
+            latent = latent * (energy / dim).sqrt()[:, None, :, :, None]
+            tokens = (expanded_condition + latent).reshape(
+                batch * samples, height, width, dim
+            )
+            random_memories = ()
+
+        random_index = 0
+        for index in range(len(self.blocks) + 1):
+            while (
+                self.random_attention_enabled
+                and random_index < len(self.random_positions)
+                and self.random_positions[random_index] == index
+            ):
+                random_layer = self.random_attentions[random_index]
+                random_memory = random_memories[random_index]
+                if self.gradient_checkpointing and self.training:
+                    tokens = checkpoint(
+                        random_layer,
+                        tokens,
+                        random_memory,
+                        use_reentrant=False,
+                    )
+                else:
+                    tokens = random_layer(tokens, random_memory)
+                random_index += 1
+            if index == len(self.blocks):
+                break
+            block = self.blocks[index]
             if self.gradient_checkpointing and self.training:
                 tokens = checkpoint(block, tokens, use_reentrant=False)
             else:
@@ -739,9 +967,17 @@ class StochasticImageBridge(nn.Module):
         fullres_dim: int = 320,
         fullres_depth: int = 12,
         fullres_cross_depth: int = 2,
+        fullres_cross_gate_init: float = 1.0,
         fullres_ffn_ratio: float = 2.0,
         fullres_window_size: int = 8,
         fullres_gradient_checkpointing: bool = True,
+        fullres_random_attention: bool = False,
+        fullres_random_slots: int = 64,
+        fullres_random_dim: int = 64,
+        fullres_random_temperature: float = 1.0,
+        fullres_random_gate1_init: float = 0.02,
+        fullres_random_gate2_init: float = 0.01,
+        fullres_random_positions: list[int] | tuple[int, ...] = (),
         image_size: int | None = None,
         **legacy: object,
     ) -> None:
@@ -816,6 +1052,7 @@ class StochasticImageBridge(nn.Module):
                 heads=heads,
                 depth=fullres_depth,
                 cross_depth=fullres_cross_depth,
+                cross_gate_init=fullres_cross_gate_init,
                 ffn_ratio=fullres_ffn_ratio,
                 window_size=fullres_window_size,
                 max_residual=max_residual,
@@ -825,6 +1062,13 @@ class StochasticImageBridge(nn.Module):
                 noise_energy_parameterization=normalized_energy_parameterization,
                 noise_amplitude_safety_max=noise_amplitude_safety_max,
                 gradient_checkpointing=fullres_gradient_checkpointing,
+                random_attention=fullres_random_attention,
+                random_slots=fullres_random_slots,
+                random_dim=fullres_random_dim,
+                random_temperature=fullres_random_temperature,
+                random_gate1_init=fullres_random_gate1_init,
+                random_gate2_init=fullres_random_gate2_init,
+                random_positions=fullres_random_positions,
             )
             self.encoder_type = "fullres_axial"
             self.decoder_type = "linear_pixel"

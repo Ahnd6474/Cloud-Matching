@@ -41,7 +41,14 @@ def parse_args() -> argparse.Namespace:
         description="Generate a fixed sharded bridge dataset before training"
     )
     parser.add_argument("--config", default="configs/train.yaml")
-    parser.add_argument("--data", help="Override source image directory")
+    parser.add_argument(
+        "--data",
+        action="append",
+        help=(
+            "Override a source image directory; repeat for multiple datasets "
+            "(for example DIV2K plus Flickr2K)"
+        ),
+    )
     parser.add_argument("--output", help="Override data.prepared_root")
     parser.add_argument("--variants", type=int, help="Records per source image")
     parser.add_argument("--device", help="For example: cuda, cuda:0, or cpu")
@@ -53,7 +60,7 @@ def main() -> None:
     args = parse_args()
     config = load_config(args.config)
     if args.data:
-        config.data.root = args.data
+        config.data.roots = args.data
         config.data.synthetic = False
     if args.synthetic:
         config.data.synthetic = True
@@ -72,7 +79,7 @@ def main() -> None:
         SyntheticImageDataset(config.data.synthetic_length, config.data.image_size)
         if config.data.synthetic
         else ImageDirectoryDataset(
-            config.data.root,
+            config.data.roots or config.data.root,
             config.data.image_size,
             random_crop=config.data.random_crop,
             crop_mode=config.data.crop_mode,
@@ -129,6 +136,7 @@ def main() -> None:
         save_target_noise=mixture is None,
         metadata={
             "source_images": len(source),
+            "source_roots": [str(value) for value in getattr(source, "roots", [])],
             "variants_per_image": variants,
             "image_size": config.data.image_size,
             "channels": config.model.in_channels,
@@ -149,6 +157,18 @@ def main() -> None:
                 goal_corruptor=goal_corruptor,
                 corruption_mixture=mixture,
                 clean_answer_probability=config.schedule.clean_answer_probability,
+                goal_from_clean=config.schedule.goal_from_clean,
+                answer_from_current=config.schedule.answer_from_current,
+                adaptive_answer_jump=config.schedule.adaptive_answer_jump,
+                near_clean_threshold=config.schedule.near_clean_threshold,
+                near_clean_answer_jump=config.schedule.near_clean_answer_jump,
+                near_clean_answer_jump_min=(
+                    config.schedule.near_clean_answer_jump_min
+                ),
+                mid_clean_threshold=config.schedule.mid_clean_threshold,
+                mid_clean_answer_jump=config.schedule.mid_clean_answer_jump,
+                mid_clean_answer_jump_min=config.schedule.mid_clean_answer_jump_min,
+                near_clean_probability=config.schedule.near_clean_probability,
                 endpoint_corruption_mixture=endpoint_mixture,
                 endpoint_corruption_probability=endpoint.probability,
             )

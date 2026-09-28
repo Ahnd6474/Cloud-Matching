@@ -47,6 +47,80 @@ def test_level_triplet_can_force_clean_answers() -> None:
     assert torch.count_nonzero(answer) == 0
 
 
+def test_level_triplet_can_train_current_relative_next_state() -> None:
+    current, goal, answer = sample_level_triplet(
+        batch_size=256,
+        max_level=100,
+        answer_jump=10,
+        goal_from_clean=True,
+        answer_from_current=True,
+    )
+    assert torch.count_nonzero(goal) == 0
+    assert torch.all((current >= 1) & (current <= 100))
+    assert torch.all(answer == (current - 10).clamp_min(0))
+
+
+def test_level_triplet_uses_finer_adaptive_steps_near_clean() -> None:
+    current, goal, answer = sample_level_triplet(
+        batch_size=2048,
+        max_level=100,
+        answer_jump=10,
+        goal_from_clean=True,
+        answer_from_current=True,
+        adaptive_answer_jump=True,
+        near_clean_threshold=20,
+        near_clean_answer_jump=2,
+        mid_clean_threshold=50,
+        mid_clean_answer_jump=5,
+        near_clean_probability=0.75,
+    )
+    expected_jump = torch.where(
+        current <= 20,
+        torch.full_like(current, 2),
+        torch.where(current <= 50, torch.full_like(current, 5), torch.full_like(current, 10)),
+    )
+    assert torch.count_nonzero(goal) == 0
+    assert torch.all(answer == (current - expected_jump).clamp_min(0))
+    assert (current <= 20).float().mean().item() > 0.70
+
+
+def test_level_triplet_can_vary_adaptive_jump_density() -> None:
+    current, _, answer = sample_level_triplet(
+        batch_size=4096,
+        max_level=1000,
+        answer_jump=100,
+        goal_from_clean=True,
+        answer_from_current=True,
+        adaptive_answer_jump=True,
+        near_clean_threshold=200,
+        near_clean_answer_jump_min=5,
+        near_clean_answer_jump=20,
+        mid_clean_threshold=500,
+        mid_clean_answer_jump_min=20,
+        mid_clean_answer_jump=50,
+        near_clean_probability=0.75,
+    )
+    jump = current - answer
+    unclamped_near = (current <= 200) & (answer > 0)
+    mid = (current > 200) & (current <= 500)
+    far = current > 500
+    assert torch.all((jump[unclamped_near] >= 5) & (jump[unclamped_near] <= 20))
+    assert torch.all((jump[mid] >= 20) & (jump[mid] <= 50))
+    assert torch.all(jump[far] == 100)
+    assert jump[unclamped_near].unique().numel() > 8
+
+
+def test_tenfold_microstep_schedule_preserves_total_corruption() -> None:
+    coarse = VPNoiseSchedule(steps=100, beta_start=1e-4, beta_end=2e-2)
+    fine = VPNoiseSchedule(steps=1000, beta_start=1e-5, beta_end=2e-3)
+    torch.testing.assert_close(
+        coarse.alpha_bars,
+        fine.alpha_bars[::10],
+        atol=2.5e-3,
+        rtol=0.0,
+    )
+
+
 def test_level_triplet_rejects_invalid_clean_probability() -> None:
     with pytest.raises(ValueError, match="clean_answer_probability"):
         sample_level_triplet(
@@ -165,6 +239,7 @@ def test_training_batch_contains_reparameterization_noise() -> None:
     )
     expected = mean[:, None] + variance.sqrt()[:, None] * batch.target_noise
     torch.testing.assert_close(batch.target_cloud, expected)
+    assert batch.target_noise_seed is not None
     assert batch.goal.shape == clean.shape
     assert torch.all(batch.current_level > batch.goal_level)
 
@@ -205,6 +280,32 @@ def test_paired_and_energy_losses_backpropagate() -> None:
     (paired + energy).backward()
     assert predicted.grad is not None
     assert torch.isfinite(predicted.grad).all()
+
+
+def test_unbiased_energy_excludes_and_renormalizes_self_diagonals() -> None:
+    current = torch.zeros(1, 1, 1, 1)
+    predicted = torch.tensor([[[[[0.0]]], [[[2.0]]]]])
+    target = torch.tensor([[[[[1.0]]], [[[3.0]]]]])
+    features = torch.nn.Flatten(start_dim=1)
+
+    biased = EnergyCorrectionCloudLoss(features)(predicted, target, current)
+    unbiased = EnergyCorrectionCloudLoss(features, unbiased=True)(
+        predicted, target, current
+    )
+
+    # Cross mean is 1.5. V self means are 1.0; U self means are 2.0.
+    torch.testing.assert_close(biased, torch.tensor(1.0))
+    torch.testing.assert_close(unbiased, torch.tensor(-1.0))
+
+
+def test_unbiased_energy_requires_two_cloud_samples() -> None:
+    current = torch.zeros(1, 1, 1, 1)
+    cloud = torch.zeros(1, 1, 1, 1, 1)
+    criterion = EnergyCorrectionCloudLoss(
+        torch.nn.Flatten(start_dim=1), unbiased=True
+    )
+    with pytest.raises(ValueError, match="at least two samples"):
+        criterion(cloud, cloud, current)
 
 
 def test_paired_loss_does_not_average_normalized_features_twice() -> None:
@@ -409,6 +510,80 @@ def test_full_resolution_axial_bridge_is_pixel_aligned_and_trainable() -> None:
         isinstance(module, (torch.nn.Conv2d, torch.nn.ConvTranspose2d))
         for module in model.fullres.modules()
     )
+
+
+def test_full_resolution_random_attention_has_independent_trainable_layers() -> None:
+    torch.manual_seed(41)
+    model = StochasticImageBridge(
+        architecture="fullres_axial",
+        in_channels=3,
+        heads=4,
+        noise_variance_min=1e-4,
+        noise_variance_max=2.0,
+        noise_variance_init=1.0,
+        noise_energy_parameterization="fixed_unit",
+        fullres_dim=32,
+        fullres_depth=4,
+        fullres_cross_depth=1,
+        fullres_ffn_ratio=2.0,
+        fullres_window_size=4,
+        fullres_gradient_checkpointing=False,
+        fullres_random_attention=True,
+        fullres_random_slots=8,
+        fullres_random_dim=12,
+        fullres_random_temperature=0.8,
+        fullres_random_gate1_init=0.02,
+        fullres_random_gate2_init=0.01,
+    )
+    first, second = model.fullres.random_attentions
+    assert model.fullres.random_positions == (0, 2)
+    torch.testing.assert_close(first.gate.detach(), torch.tensor(0.02))
+    torch.testing.assert_close(second.gate.detach(), torch.tensor(0.01))
+    assert first.key_projection.weight.data_ptr() != second.key_projection.weight.data_ptr()
+    assert first.value_projection.weight.data_ptr() != second.value_projection.weight.data_ptr()
+
+    current = torch.randn(1, 3, 8, 8).clamp(-1.0, 1.0)
+    goal = torch.randn(1, 3, 8, 8).clamp(-1.0, 1.0)
+    noise = torch.randn(1, 2, 3, 8, 8)
+    cloud = model(current, goal, samples=2, noise=noise)
+    repeated = model(current, goal, samples=2, noise=noise)
+    assert cloud.shape == (1, 2, 3, 8, 8)
+    torch.testing.assert_close(cloud, repeated)
+    assert cloud.std(dim=1).mean().item() > 0.0
+
+    cloud.square().mean().backward()
+    for layer in model.fullres.random_attentions:
+        assert layer.gate.grad is not None
+        assert layer.gate.grad.abs().item() > 0.0
+        assert layer.key_projection.weight.grad is not None
+        assert layer.value_projection.weight.grad is not None
+
+
+def test_full_resolution_cross_attention_has_learned_spatial_gates() -> None:
+    model = StochasticImageBridge(
+        architecture="fullres_axial",
+        in_channels=3,
+        heads=4,
+        noise_variance_min=1e-4,
+        noise_variance_max=1.0,
+        noise_variance_init=0.1,
+        fullres_dim=32,
+        fullres_depth=2,
+        fullres_cross_depth=1,
+        fullres_cross_gate_init=0.5,
+        fullres_window_size=4,
+        fullres_gradient_checkpointing=False,
+    )
+    block = model.fullres.cross_blocks[0]
+    for projection in block.gate_projections:
+        torch.testing.assert_close(projection.weight, torch.zeros_like(projection.weight))
+        torch.testing.assert_close(
+            torch.sigmoid(projection.bias), torch.full_like(projection.bias, 0.5)
+        )
+    current = torch.randn(1, 3, 8, 8)
+    goal = torch.randn(1, 3, 8, 8)
+    model(current, goal, samples=2).square().mean().backward()
+    assert all(projection.weight.grad is not None for projection in block.gate_projections)
 
 
 def test_softplus_amplitude_energy_has_no_legacy_sigmoid_ceiling() -> None:

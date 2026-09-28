@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 
 import torch
@@ -18,26 +19,43 @@ def normalize_image(value: Tensor) -> Tensor:
 
 
 class ImageDirectoryDataset(Dataset[Tensor]):
-    """Load every image below a directory; class subfolders are optional."""
+    """Load every image below one or more directories.
+
+    Multiple roots are useful for DF2K-style training: DIV2K and Flickr2K can
+    remain in their original layouts without duplicating several gigabytes of
+    HR images into a merged directory.
+    """
 
     def __init__(
         self,
-        root: str | Path,
+        root: str | Path | Sequence[str | Path],
         image_size: int,
         random_crop: bool = True,
         crop_mode: str = "resized",
         horizontal_flip: bool = True,
     ) -> None:
-        self.root = Path(root).expanduser().resolve()
-        if not self.root.is_dir():
-            raise FileNotFoundError(f"image directory does not exist: {self.root}")
+        raw_roots = [root] if isinstance(root, (str, Path)) else list(root)
+        if not raw_roots:
+            raise ValueError("at least one image directory is required")
+        self.roots = [Path(value).expanduser().resolve() for value in raw_roots]
+        for resolved_root in self.roots:
+            if not resolved_root.is_dir():
+                raise FileNotFoundError(
+                    f"image directory does not exist: {resolved_root}"
+                )
+        # Keep ``root`` for callers that used it for display/debugging.
+        self.root = self.roots[0]
         self.paths = sorted(
             path
-            for path in self.root.rglob("*")
+            for resolved_root in self.roots
+            for path in resolved_root.rglob("*")
             if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
         )
         if not self.paths:
-            raise RuntimeError(f"no supported images found below {self.root}")
+            raise RuntimeError(
+                "no supported images found below: "
+                + ", ".join(str(value) for value in self.roots)
+            )
 
         normalized_crop_mode = crop_mode.strip().lower()
         if normalized_crop_mode == "native":
