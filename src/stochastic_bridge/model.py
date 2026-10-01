@@ -553,7 +553,7 @@ MultiscalePooledAttention2d = MultiscaleCvTAttention2d
 
 
 class FullResolutionCrossBlock(nn.Module):
-    """Fuse current and dream-goal pixels with local and axial cross attention."""
+    """Fuse image conditions with CvT or legacy factorized cross attention."""
 
     def __init__(
         self,
@@ -739,7 +739,7 @@ class FullResolutionTextCrossBlock(nn.Module):
 
 
 class FullResolutionMixerBlock(nn.Module):
-    """One local, row-axial, or column-axial transformer block."""
+    """One CvT or legacy local/axial transformer block followed by an FFN."""
 
     def __init__(
         self,

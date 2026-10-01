@@ -413,12 +413,13 @@ The unnormalized `w` is retained for sampling. Its normalized form
 high-frequency correction-energy distribution derived from the target cloud.
 This CE term teaches only *where* to sample: multiplying all `w` values by a
 constant leaves it unchanged. Absolute strength and decoded appearance remain
-self-supervised by Energy distance. The pooled-multiscale width-320, depth-12
-configuration has 12.27M parameters.
+self-supervised by Energy distance. The image-conditioned CvT width-320,
+depth-12 configuration has 12.27M parameters.
 
 ### 5. Residual update and recurrence
 
-Both decoders end with a bounded residual and a learned per-pixel/channel gate:
+The pyramid implicit decoder ends with a bounded residual and a learned
+per-pixel/channel gate:
 
 ```math
 \Delta_m = \Delta_{max}\tanh(r_m), \qquad
@@ -426,11 +427,17 @@ u_m=\sigma(q_m), \qquad
 y_m=\mathrm{clip}(x_t+u_m\odot\Delta_m,-1,1).
 ```
 
+The full-resolution CvT core instead predicts its bounded RGB residual
+directly: `y_m = clip(x_t + max_residual * tanh(r_m), -1, 1)`. Its learned
+cross-attention and random-attention gates control feature updates upstream;
+there is no separate pixel output gate.
+
 The network is trained as a one-step transition operator. A rollout is not an
 internal recurrent layer: inference explicitly feeds one output back as the
 next `current` while keeping `goal_0` and, when requested, its trajectory latent
-fixed. Image height and width may differ from training resolution, but both
-must currently be divisible by 8.
+fixed. The pyramid path requires height and width divisible by 8. The
+full-resolution CvT path accepts arbitrary positive spatial sizes because its
+query grid is never patchified or downsampled.
 
 ## Distribution losses
 

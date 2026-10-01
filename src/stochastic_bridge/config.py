@@ -173,6 +173,9 @@ class ModelConfig:
     fullres_ffn_ratio: float = 2.0
     fullres_window_size: int = 8
     fullres_gradient_checkpointing: bool = True
+    # `cvt` is the canonical full-resolution production path.  The legacy
+    # linear/factorized defaults remain here so old sparse configs reproduce
+    # their original models; current configs select CvT explicitly.
     fullres_encoder_type: str = "linear"
     fullres_attention_type: str = "factorized"
     fullres_pooled_kernel_sizes: list[int] = field(
