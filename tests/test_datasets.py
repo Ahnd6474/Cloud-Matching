@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import numpy as np
 import pytest
 from PIL import Image
 
-from stochastic_bridge.datasets import ImageDirectoryDataset
+from stochastic_bridge.datasets import CocoCaptionDataset, ImageDirectoryDataset
+from stochastic_bridge.text import CocoWordTokenizer
 
 
 def test_native_crop_preserves_source_pixels(tmp_path) -> None:
@@ -46,3 +48,63 @@ def test_image_directory_dataset_combines_multiple_roots(tmp_path) -> None:
 
     assert len(dataset) == 2
     assert dataset.roots == [first.resolve(), second.resolve()]
+
+
+def test_coco_caption_dataset_preserves_whole_scene_and_caption(tmp_path) -> None:
+    image_root = tmp_path / "train2017"
+    image_root.mkdir()
+    Image.new("RGB", (20, 10), color=(255, 0, 0)).save(
+        image_root / "000000000001.jpg"
+    )
+    annotation_path = tmp_path / "captions.json"
+    annotation_path.write_text(
+        json.dumps(
+            {
+                "images": [{"id": 1, "file_name": "000000000001.jpg"}],
+                "annotations": [
+                    {"image_id": 1, "caption": "A red rectangle."},
+                    {"image_id": 1, "caption": "A wide red image."},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    dataset = CocoCaptionDataset(
+        image_root,
+        annotation_path,
+        16,
+        random_caption=False,
+    )
+    sample = dataset[0]
+    assert sample["clean"].shape == (3, 16, 16)
+    assert sample["caption"] == "A red rectangle."
+    # The 2:1 image is fitted to 16x8 with neutral padding, not cropped.
+    assert sample["clean"][:, :4].abs().max().item() == 0.0
+
+
+def test_coco_tokenizer_build_save_and_batch_encode(tmp_path) -> None:
+    annotation_path = tmp_path / "captions.json"
+    annotation_path.write_text(
+        json.dumps(
+            {
+                "annotations": [
+                    {"caption": "A small red bird."},
+                    {"caption": "A small blue bird."},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    tokenizer = CocoWordTokenizer.build_from_coco(
+        annotation_path,
+        vocab_size=12,
+        min_frequency=1,
+        max_length=8,
+    )
+    saved = tokenizer.save(tmp_path / "vocab.json")
+    loaded = CocoWordTokenizer.load(saved)
+    ids, mask = loaded.batch_encode(["A red bird.", "unknown creature"])
+    assert ids.shape == mask.shape == (2, 8)
+    assert ids[0, 0].item() == 1
+    assert mask.sum(dim=1).tolist() == [6, 4]
+    assert loaded.token_to_id["<unk>"] in ids[1].tolist()

@@ -345,36 +345,76 @@ The legacy `conv` decoder instead injects projected latent noise at the
 bottleneck and all three upsampling scales, using current-image pyramid skips
 and transposed-convolution decoder stages. It remains available for ablations.
 
-### Full-resolution axial/local transformer
+### Full-resolution CvT cloud transformer
 
-`model.architecture: fullres_axial` selects the bottleneck-free experimental
-path in `configs/kaggle_div2k_fullres_axial.yaml`. Current and dream-goal RGB
-pixels are embedded as one token per pixel; there is no patchification or
-spatial downsampling. One or more cross-fusion blocks combine local-window,
-row-axial, and column-axial cross attention. The fused grid predicts a positive
-noise-energy map `w[B,H,W]`, and each implicit cloud member uses
+The main full-resolution path is now the CvT-style configuration selected by
+`fullres_encoder_type: cvt` and `fullres_attention_type: cvt`. The outer
+architecture key remains `fullres_axial` for checkpoint compatibility, but the
+current COCO and U-stat experiments use CvT attention rather than the legacy
+axial/local mixer. This is a project-specific CvT variant, not a verbatim copy
+of the staged architecture from the CvT paper.
+
+The important design choice is to retain one query for every image position
+while convolutionally compressing only the key/value context:
+
+1. A shared 3x3 convolutional stem embeds the current image, followed by a
+   gated depthwise 3x3 and pointwise local refinement. There is no patch
+   embedding or spatial bottleneck in the residual stream.
+2. Full-resolution `Q[B,H*W,D]` preserves the position at which a correction
+   will be written.
+3. Learned depthwise 3x3, 5x5, and 7x7 projections reduce the context to 8x8,
+   4x4, and 2x2 grids. Their concatenation supplies only 84 multiscale K/V
+   tokens to learned multi-head attention.
+4. Every CvT attention block is followed by its own pre-normalized GELU FFN.
+   Optional random attention is inserted before the configured refinement
+   block, so subsequent CvT+FFN blocks can spatially regularize the sampled
+   content.
+5. A normalized linear RGB head writes a bounded residual directly on the
+   native grid. The decoder contains no transposed convolution or learned
+   upsampling phase.
+
+For a 128x128 image, dense spatial attention would form 16,384x16,384 scores
+per head. The CvT path forms 16,384x84 scores instead: about 195x fewer
+attention-score elements. This reduction does not include the Q projection or
+FFN cost, but it is what makes global spatial context practical without
+discarding pixel-aligned queries. The convolutional projections also give the
+model a useful local/multiscale image bias that a bare per-pixel linear
+embedding lacks. Current experiments favor this path for optimization and
+reconstruction quality; that observation is not yet a controlled architecture
+ablation.
+
+Image goals use the same shared CvT encoder and CvT cross attention. Text goals
+use a jointly trained caption Transformer and full image-query/text-KV cross
+attention because at most 48 text tokens are cheap enough that K/V pooling is
+unnecessary. After conditioning, both routes use the same CvT refinement and
+cloud decoder.
+
+The legacy names `pooled_attention` and `pooled_multiscale` are still accepted
+as aliases of `cvt`, so existing YAML files and checkpoint state dictionaries
+remain loadable. `linear`, `cnn`, and `factorized` remain available only for
+ablations and older checkpoints.
+
+The fused grid predicts a positive noise-energy map `w[B,H,W]`, and each cloud
+member uses
 
 ```math
 e_{m,i}=\sqrt{w_i/D}\,\epsilon_{m,i},\qquad
 \epsilon_{m,i}\sim\mathcal N(0,I_D).
 ```
 
-After injection, blocks follow the repeating pattern `local -> row -> local ->
-column`. Local blocks alternate ordinary and shifted non-wrapping windows;
-two consecutive axial directions provide global image connectivity without the
-quadratic cost of full spatial attention. A normalized linear head directly
-returns one RGB residual per pixel. Unlike the pyramid path, arbitrary spatial
-sizes are supported and no convolution, transposed convolution, LIIF query, or
-patch unprojection is used.
+When `fullres_random_attention` is enabled, one Gaussian random memory is
+injected through attention before the configured refinement block; there is no
+second random-memory layer. Arbitrary spatial sizes are supported. Convolution
+is used only to encode/project spatial context; the output path has no
+transposed convolution, LIIF query, or patch unprojection.
 
 The unnormalized `w` is retained for sampling. Its normalized form
 `p_i=w_i/sum(w)` is optionally trained with `loss.spatial_ce_weight` against the
 high-frequency correction-energy distribution derived from the target cloud.
 This CE term teaches only *where* to sample: multiplying all `w` values by a
 constant leaves it unchanged. Absolute strength and decoded appearance remain
-self-supervised by Energy distance. The supplied full-resolution Kaggle config
-uses a 13.17M-parameter, width-320, depth-12 model with activation
-checkpointing.
+self-supervised by Energy distance. The pooled-multiscale width-320, depth-12
+configuration has 12.27M parameters.
 
 ### 5. Residual update and recurrence
 
@@ -434,7 +474,10 @@ model:
   fullres_depth: 12
   fullres_cross_depth: 2
   fullres_ffn_ratio: 2.0
-  fullres_window_size: 8
+  fullres_encoder_type: cvt
+  fullres_attention_type: cvt
+  fullres_pooled_kernel_sizes: [3, 5, 7]
+  fullres_pooled_output_sizes: [8, 4, 2]
   fullres_gradient_checkpointing: true
   noise_variance_init: 0.1
   noise_energy_parameterization: softplus_amplitude
@@ -634,6 +677,47 @@ TensorBoard:
 ```powershell
 .\.venv\Scripts\tensorboard.exe --logdir runs
 ```
+
+## COCO caption-conditioned experiment
+
+The text path does not depend on CLIP. It builds a deterministic 16K word
+vocabulary from COCO Captions and jointly trains token embeddings, learned
+positions, a four-layer Transformer text encoder, full image-to-text cross
+attention, and the cloud-matching generator. The image generator uses the
+full-resolution CvT core described above: convolutional multiscale K/V,
+pixel-aligned Q, optional random memory, CvT+FFN refinement, and a direct RGB
+residual head.
+
+Download and prepare the official COCO 2017 train/validation images and human
+captions. The source JPEG files stay at native resolution; the dataset loader
+fits the whole scene into 128x128 with neutral padding at training time so a
+captioned object is not silently removed by an aggressive random crop.
+
+```bash
+python prepare_coco.py --root data/coco2017
+```
+
+Start on one GPU:
+
+```bash
+python train_coco_text_ddp.py \
+  --config configs/coco_text_fullres.yaml \
+  --coco-root data/coco2017
+```
+
+Start on two GPUs:
+
+```bash
+torchrun --standalone --nproc_per_node=2 train_coco_text_ddp.py \
+  --config configs/coco_text_fullres.yaml \
+  --coco-root data/coco2017
+```
+
+TensorBoard records aligned `clean | current | target mean | prediction mean |
+prediction sample` images, the captions used for those rows, and
+`text/shuffled_caption_output_l1`. The last metric runs the same current/noise
+with captions permuted across the batch; a value that stays at zero indicates
+that the generator is ignoring its text condition.
 
 ## Kaggle DIV2K structured-endpoint experiment
 

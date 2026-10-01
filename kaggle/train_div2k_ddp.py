@@ -103,6 +103,11 @@ def distributed_setup(requested_device: str) -> tuple[int, int, int, torch.devic
         # same trainer can be smoke-tested on Windows builds without libuv.
         init_method = os.environ.get("CLOUD_MATCHING_DIST_INIT_METHOD", "env://")
         init_kwargs: dict[str, Any] = {}
+        if use_cuda:
+            # Make the rank-to-GPU mapping explicit.  Besides avoiding NCCL's
+            # device guessing, this makes collectives such as barrier safe on
+            # hosts where local and global ranks are not interchangeable.
+            init_kwargs["device_id"] = torch.device(f"cuda:{local_rank}")
         if init_method != "env://":
             init_kwargs.update(rank=rank, world_size=world_size)
         dist.init_process_group(
@@ -236,24 +241,12 @@ def log_validation_images(
         maximum = flat.max(dim=1).values[:, None, None, None]
         normalized = (energy - minimum) / (maximum - minimum).clamp_min(1e-8)
         images["noise_energy_normalized"] = normalized.repeat(1, 3, 1, 1)
-        writer.add_histogram(
-            "validation/noise_energy_distribution",
-            energy,
-            global_step=epoch,
-        )
 
     # Each example occupies one row; columns follow the order in `images`.
     comparison = torch.stack(list(images.values()), dim=1).flatten(0, 1)
     writer.add_image(
         "validation/comparison",
         make_grid(comparison, nrow=len(images), padding=2),
-        global_step=epoch,
-    )
-    for name, value in images.items():
-        writer.add_images(f"validation/{name}", value, global_step=epoch)
-    writer.add_text(
-        "validation/comparison_columns",
-        " | ".join(images),
         global_step=epoch,
     )
 
@@ -509,6 +502,27 @@ def main() -> None:
         if is_main
         else None
     )
+    if is_main:
+        print(
+            "DDP/data configuration: "
+            + json.dumps(
+                {
+                    "world_size": world_size,
+                    "per_device_batch_size": config.data.batch_size,
+                    "global_batch_size": config.data.batch_size * world_size,
+                    "cloud_samples_per_image": config.loss.samples,
+                    "cloud_paths_per_device_step": (
+                        config.data.batch_size * config.loss.samples
+                    ),
+                    "global_cloud_paths_per_step": (
+                        config.data.batch_size * config.loss.samples * world_size
+                    ),
+                    "steps_per_epoch": len(train_loader),
+                    "workers_per_rank": config.data.workers,
+                    "prefetch_factor": config.data.prefetch_factor,
+                }
+            )
+        )
 
     model = StochasticImageBridge(**config.model.__dict__).to(device)
     channels_last = (
@@ -606,26 +620,45 @@ def main() -> None:
         source_random_attention = bool(
             source_model_config.get("fullres_random_attention", False)
         )
+        source_fullres_encoder = source_model_config.get(
+            "fullres_encoder_type", "linear"
+        )
         adding_random_attention = (
             config.model.architecture == "fullres_axial"
             and config.model.fullres_random_attention
             and not source_random_attention
         )
+        adding_cnn_encoder = (
+            config.model.architecture == "fullres_axial"
+            and config.model.fullres_encoder_type == "cnn"
+            and source_fullres_encoder != "cnn"
+        )
         incompatible = model.load_state_dict(state["model"], strict=False)
         allowed_missing_prefixes = ["fullres.cross_blocks."]
         if adding_random_attention:
             allowed_missing_prefixes.append("fullres.random_attentions.")
+        if adding_cnn_encoder:
+            allowed_missing_prefixes.append("fullres.image_encoder.local_refinement.")
+            allowed_missing_prefixes.append("fullres.image_encoder.local_gate")
+            allowed_missing_prefixes.append("fullres.image_encoder.norm.")
         invalid_missing = [
             name
             for name in incompatible.missing_keys
             if not (
-                name.endswith("gate_projections.0.weight")
-                or name.endswith("gate_projections.0.bias")
-                or name.endswith("gate_projections.1.weight")
-                or name.endswith("gate_projections.1.bias")
-                or name.endswith("gate_projections.2.weight")
-                or name.endswith("gate_projections.2.bias")
-                or any(name.startswith(prefix) for prefix in allowed_missing_prefixes[1:])
+                name.endswith(
+                    (
+                        "gate_projections.0.weight",
+                        "gate_projections.0.bias",
+                        "gate_projections.1.weight",
+                        "gate_projections.1.bias",
+                        "gate_projections.2.weight",
+                        "gate_projections.2.bias",
+                    )
+                )
+                or any(
+                    name.startswith(prefix)
+                    for prefix in allowed_missing_prefixes[1:]
+                )
             )
         ]
         unexpected = list(incompatible.unexpected_keys)
@@ -634,13 +667,19 @@ def main() -> None:
                 "checkpoint mismatch outside newly added attention gates: "
                 f"missing={invalid_missing}, unexpected={unexpected}"
             )
-        if adding_random_attention:
-            if is_main:
-                print(
-                    "initialized two new random-attention layers while loading "
-                    "all compatible checkpoint weights"
-                )
-        if is_main and any("gate_projections" in name for name in incompatible.missing_keys):
+        if adding_random_attention and is_main:
+            print(
+                "initialized one new random-attention layer while loading "
+                "all compatible checkpoint weights"
+            )
+        if adding_cnn_encoder and is_main:
+            print(
+                "expanded the pixel-linear weights into the CNN center kernel; "
+                "initialized the local refinement branch from scratch"
+            )
+        if is_main and any(
+            "gate_projections" in name for name in incompatible.missing_keys
+        ):
             print("initialized learned cross-attention gates from the new config")
         source_energy_parameterization = source_model_config.get(
             "noise_energy_parameterization", "bounded"
@@ -706,6 +745,12 @@ def main() -> None:
         )
         writer = SummaryWriter(log_dir=tensorboard_dir)
         writer.add_text("run/config", json.dumps(config.to_dict(), indent=2), 0)
+        writer.add_text(
+            "run/validation_comparison_columns",
+            "clean | goal | current | target_mean | prediction_mean | "
+            "prediction_sample_0 | noise_energy_normalized (when enabled)",
+            0,
+        )
         if lr_override:
             override_metadata = {
                 "resume_epoch": start_epoch,
@@ -729,6 +774,8 @@ def main() -> None:
     for epoch in range(start_epoch, config.train.epochs):
         train_batch_sampler.set_epoch(epoch)
         train_model.train()
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
         totals = torch.zeros(13, device=device)
         progress = tqdm(
             train_loader,
@@ -803,12 +850,13 @@ def main() -> None:
             count = batch["clean"].shape[0]
             predicted_diversity = cloud_diversity(predicted)
             target_diversity = cloud_diversity(batch["target_cloud"])
+            batch_output_psnr = psnr(
+                predicted.detach().float().mean(1), batch["clean"].float()
+            )
             totals += torch.stack(
                 [
                     loss.detach().float() * count,
-                    psnr(
-                        predicted.detach().float().mean(1), batch["clean"].float()
-                    ).sum(),
+                    batch_output_psnr.sum(),
                     grad_norm.detach().float(),
                     noise_variance.detach().float().sum(),
                     torch.tensor(float(count), device=device),
@@ -826,29 +874,9 @@ def main() -> None:
                 progress.set_postfix(loss=f"{loss.item():.4f}")
                 assert writer is not None
                 global_step = epoch * len(train_loader) + batch_index + 1
-                writer.add_scalar("batch/train_loss", loss.item(), global_step)
+                writer.add_scalar("batch/loss", loss.item(), global_step)
                 writer.add_scalar(
-                    "batch/train_cloud_loss", cloud_loss.item(), global_step
-                )
-                writer.add_scalar(
-                    "batch/train_perceptual_loss",
-                    perceptual_loss.item(),
-                    global_step,
-                )
-                writer.add_scalar(
-                    "batch/train_perceptual_contribution",
-                    config.loss.perceptual_weight * perceptual_loss.item(),
-                    global_step,
-                )
-                writer.add_scalar(
-                    "batch/train_spatial_ce", spatial_loss.item(), global_step
-                )
-                writer.add_scalar("batch/paired_mean_loss", mean_loss.item(), global_step)
-                writer.add_scalar(
-                    "batch/paired_deviation_loss", deviation_loss.item(), global_step
-                )
-                writer.add_scalar(
-                    "batch/paired_variance_loss", variance_loss.item(), global_step
+                    "batch/output_psnr", batch_output_psnr.mean().item(), global_step
                 )
                 writer.add_scalar(
                     "batch/predicted_diversity",
@@ -860,44 +888,46 @@ def main() -> None:
                     target_diversity.mean().item(),
                     global_step,
                 )
-                writer.add_scalar(
-                    "batch/noise_variance", noise_variance.float().mean().item(), global_step
-                )
-                if (
-                    model.architecture == "fullres_axial"
-                    and model.fullres.random_attention_enabled
-                ):
-                    for index, random_layer in enumerate(
-                        model.fullres.random_attentions, start=1
-                    ):
-                        writer.add_scalar(
-                            f"batch/random_gate_{index}",
-                            random_layer.gate.detach().float().item(),
-                            global_step,
-                        )
-                if model.architecture == "fullres_axial":
-                    for block_index, cross_block in enumerate(
-                        model.fullres.cross_blocks, start=1
-                    ):
-                        for gate_index, projection in enumerate(
-                            cross_block.gate_projections, start=1
-                        ):
-                            writer.add_scalar(
-                                f"batch/cross_gate_{block_index}_{gate_index}_bias_open",
-                                torch.sigmoid(projection.bias.detach().float()).mean().item(),
-                                global_step,
-                            )
-                            writer.add_scalar(
-                                f"batch/cross_gate_{block_index}_{gate_index}_weight_rms",
-                                projection.weight.detach().float().square().mean().sqrt().item(),
-                                global_step,
-                            )
                 writer.add_scalar("batch/gradient_norm", grad_norm.item(), global_step)
                 writer.add_scalar(
                     "batch/learning_rate", optimizer.param_groups[0]["lr"], global_step
                 )
+                if config.loss.perceptual_weight > 0.0:
+                    writer.add_scalar(
+                        "batch/perceptual_contribution",
+                        config.loss.perceptual_weight * perceptual_loss.item(),
+                        global_step,
+                    )
+                if config.loss.spatial_ce_weight > 0.0:
+                    writer.add_scalar(
+                        "batch/spatial_ce_contribution",
+                        config.loss.spatial_ce_weight * spatial_loss.item(),
+                        global_step,
+                    )
+                if config.model.noise_energy_parameterization != "fixed_unit":
+                    writer.add_scalar(
+                        "batch/noise_variance",
+                        noise_variance.float().mean().item(),
+                        global_step,
+                    )
 
         totals = reduce_totals(totals, world_size)
+        if device.type == "cuda":
+            train_peak_memory = torch.tensor(
+                [
+                    torch.cuda.max_memory_allocated(device),
+                    torch.cuda.max_memory_reserved(device),
+                ],
+                device=device,
+                dtype=torch.float64,
+            )
+            if world_size > 1:
+                dist.all_reduce(train_peak_memory, op=dist.ReduceOp.MAX)
+            train_peak_allocated_gib = train_peak_memory[0].item() / (1024**3)
+            train_peak_reserved_gib = train_peak_memory[1].item() / (1024**3)
+        else:
+            train_peak_allocated_gib = 0.0
+            train_peak_reserved_gib = 0.0
         count = max(totals[4].item(), 1.0)
         metrics = {
             "epoch": float(epoch + 1),
@@ -914,6 +944,8 @@ def main() -> None:
             "train_target_diversity": totals[11].item() / count,
             "train_perceptual_loss": totals[12].item() / count,
             "learning_rate": optimizer.param_groups[0]["lr"],
+            "train_peak_allocated_gib": train_peak_allocated_gib,
+            "train_peak_reserved_gib": train_peak_reserved_gib,
         }
         if (
             model.architecture == "fullres_axial"
@@ -948,6 +980,8 @@ def main() -> None:
             dist.barrier()
         if is_main:
             assert val_loader is not None
+            if device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(device)
             metrics.update(
                 validate(
                     model,
@@ -968,11 +1002,109 @@ def main() -> None:
                     args.validation_images,
                 )
             )
+            if device.type == "cuda":
+                metrics["val_peak_allocated_gib"] = (
+                    torch.cuda.max_memory_allocated(device) / (1024**3)
+                )
+                metrics["val_peak_reserved_gib"] = (
+                    torch.cuda.max_memory_reserved(device) / (1024**3)
+                )
             history.append(metrics)
             assert writer is not None
-            for name, value in metrics.items():
-                if name != "epoch":
-                    writer.add_scalar(f"epoch/{name}", value, epoch + 1)
+            # Keep TensorBoard intentionally compact.  history.json retains the
+            # complete diagnostic record, while the dashboard contains only
+            # signals used for routine convergence and quality decisions.
+            epoch_scalars = {
+                "loss/train": metrics["train_loss"],
+                "loss/validation": metrics["val_loss"],
+                "psnr/train_output": metrics["train_output_psnr"],
+                "psnr/validation_current": metrics["val_current_psnr"],
+                "psnr/validation_output": metrics["val_output_psnr"],
+                "diversity/train_predicted": metrics["train_predicted_diversity"],
+                "diversity/train_target": metrics["train_target_diversity"],
+                "diversity/validation_predicted": metrics["val_predicted_diversity"],
+                "diversity/validation_target": metrics["val_target_diversity"],
+                "diversity/validation_clean_predicted": metrics[
+                    "val_clean_predicted_diversity"
+                ],
+                "diversity/validation_clean_target": metrics[
+                    "val_clean_target_diversity"
+                ],
+                "diversity/validation_transition_predicted": metrics[
+                    "val_transition_predicted_diversity"
+                ],
+                "diversity/validation_transition_target": metrics[
+                    "val_transition_target_diversity"
+                ],
+                "optimization/gradient_norm": metrics["gradient_norm"],
+                "optimization/learning_rate": metrics["learning_rate"],
+                "memory/train_allocated_gib": metrics["train_peak_allocated_gib"],
+                "memory/train_reserved_gib": metrics["train_peak_reserved_gib"],
+                "memory/validation_reserved_gib": metrics[
+                    "val_peak_reserved_gib"
+                ],
+            }
+            if config.loss.perceptual_weight > 0.0:
+                epoch_scalars["loss/train_perceptual"] = metrics[
+                    "train_perceptual_loss"
+                ]
+                epoch_scalars["loss/validation_perceptual"] = metrics[
+                    "val_perceptual_loss"
+                ]
+            if config.loss.spatial_ce_weight > 0.0:
+                epoch_scalars["loss/train_spatial_ce"] = metrics["train_spatial_ce"]
+                epoch_scalars["loss/validation_spatial_ce"] = metrics[
+                    "val_spatial_ce"
+                ]
+                epoch_scalars["noise_energy/validation_p95"] = metrics[
+                    "val_noise_energy_p95"
+                ]
+                epoch_scalars["noise_energy/validation_max"] = metrics[
+                    "val_noise_energy_max"
+                ]
+            if config.model.noise_energy_parameterization != "fixed_unit":
+                epoch_scalars["noise/train_variance"] = metrics[
+                    "train_noise_variance"
+                ]
+                epoch_scalars["noise/validation_variance"] = metrics[
+                    "val_noise_variance"
+                ]
+            if (
+                model.architecture == "fullres_axial"
+                and model.fullres.random_attention_enabled
+            ):
+                for index, _ in enumerate(model.fullres.random_attentions, start=1):
+                    epoch_scalars[f"attention/random_gate_{index}"] = metrics[
+                        f"random_gate_{index}"
+                    ]
+            if model.architecture == "fullres_axial":
+                for block_index, cross_block in enumerate(
+                    model.fullres.cross_blocks, start=1
+                ):
+                    bias_values = [
+                        metrics[
+                            f"cross_gate_{block_index}_{gate_index}_bias_open"
+                        ]
+                        for gate_index, _ in enumerate(
+                            cross_block.gate_projections, start=1
+                        )
+                    ]
+                    weight_values = [
+                        metrics[
+                            f"cross_gate_{block_index}_{gate_index}_weight_rms"
+                        ]
+                        for gate_index, _ in enumerate(
+                            cross_block.gate_projections, start=1
+                        )
+                    ]
+                    epoch_scalars[
+                        f"attention/cross_block_{block_index}_bias_open_mean"
+                    ] = sum(bias_values) / len(bias_values)
+                    epoch_scalars[
+                        f"attention/cross_block_{block_index}_weight_rms_mean"
+                    ] = sum(weight_values) / len(weight_values)
+            for tag, value in epoch_scalars.items():
+                writer.add_scalar(tag, value, epoch + 1)
             writer.flush()
             (output / "history.json").write_text(
                 json.dumps(history, indent=2), encoding="utf-8"

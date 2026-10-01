@@ -19,7 +19,7 @@ from stochastic_bridge.prepared import PreparedBridgeDataset
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Ablate the two random-attention gates.")
+    parser = argparse.ArgumentParser(description="Ablate the random-attention gate.")
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--validation", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -43,14 +43,12 @@ def main() -> None:
     model = StochasticImageBridge(**config.model.__dict__).to(device).eval()
     model.load_state_dict(checkpoint["model"])
     layers = model.fullres.random_attentions
-    if len(layers) != 2:
-        raise RuntimeError("the ablation requires exactly two random-attention layers")
+    if len(layers) != 1:
+        raise RuntimeError("the ablation requires exactly one random-attention layer")
     trained_gates = [float(layer.gate.detach()) for layer in layers]
     modes = {
-        "normal": (1.0, 1.0),
-        "gate1_zero": (0.0, 1.0),
-        "gate2_zero": (1.0, 0.0),
-        "both_zero": (0.0, 0.0),
+        "normal": (1.0,),
+        "gate_zero": (0.0,),
     }
     all_rows: list[dict[str, float | int | str]] = []
     summary: dict[str, object] = {

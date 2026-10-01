@@ -1,30 +1,29 @@
 data:
-  root: ""
+  root: data/coco2017
   prepared_root: ""
-  prepared_cache_shards: 4
   synthetic: false
-  synthetic_length: 32
   image_size: 128
-  # Per GPU. With two A6000 ranks this is a global image batch of 8.
-  # A measured DDP step peaks at ~33.1 GiB allocated / 35.6 GiB reserved;
-  # batch 5 leaves too little margin for compiled graphs and validation.
+  # Per GPU; intended for two 48-GiB A6000-class devices.
   batch_size: 4
   workers: 8
   prefetch_factor: 4
-  random_crop: true
-  crop_mode: native
-  horizontal_flip: true
+  random_crop: false
+  crop_mode: resized
+  # COCO captions occasionally describe left/right, so keep geometry intact.
+  horizontal_flip: false
 
-prepare:
-  variants_per_image: 4
-  shard_size: 256
-  batch_size: 32
-  workers: 8
-  seed: 31
+text:
+  enabled: true
+  vocab_path: data/coco2017/coco_vocab.json
+  vocab_size: 16384
+  min_frequency: 2
+  max_length: 48
+  # Enables an unconditional path for later classifier-free guidance.
+  condition_dropout: 0.10
+  # The text stack starts from scratch and needs a larger LR than the generator.
+  learning_rate_multiplier: 5.0
 
 schedule:
-  # Ten micro-steps replace each old step. Scaling beta by 1/10 keeps the
-  # endpoint corruption essentially unchanged while exposing finer transitions.
   steps: 1000
   beta_start: 0.00001
   beta_end: 0.002
@@ -62,12 +61,7 @@ endpoint_corruption:
   probability: 0.0
 
 goal_corruption:
-  enabled: true
-  blur_probability: 1.0
-  downsample_probability: 0.0
-  mask_probability: 0.0
-  minimum_scale: 0.25
-  maximum_mask_fraction: 0.30
+  enabled: false
 
 model:
   architecture: fullres_axial
@@ -80,14 +74,17 @@ model:
   noise_energy_parameterization: fixed_unit
   noise_amplitude_safety_max: 8.0
   fullres_dim: 320
-  fullres_depth: 12
+  # Pooled attention replaces each old local/row/local/column cycle, so six
+  # refinement FFNs are the first efficient text-conditioned configuration.
+  fullres_depth: 6
   fullres_cross_depth: 2
   fullres_cross_gate_init: 0.5
   fullres_ffn_ratio: 2.0
   fullres_window_size: 8
   fullres_gradient_checkpointing: false
+  # Canonical full-resolution CvT path.  Legacy names
+  # pooled_attention/pooled_multiscale remain accepted for old checkpoints.
   fullres_encoder_type: cvt
-  # Full-resolution Q with 64 + 16 + 4 = 84 learned pooled K/V tokens.
   fullres_attention_type: cvt
   fullres_pooled_kernel_sizes: [3, 5, 7]
   fullres_pooled_output_sizes: [8, 4, 2]
@@ -97,12 +94,16 @@ model:
   fullres_random_temperature: 0.8
   fullres_random_gate1_init: 0.02
   fullres_random_positions: [0]
+  fullres_goal_condition: text
+  text_vocab_size: 16384
+  text_max_length: 48
+  text_depth: 4
+  text_heads: 8
+  text_ffn_ratio: 4.0
+  text_dropout: 0.1
 
 loss:
-  # U-statistic: self-distances exclude the zero diagonal and use S*(S-1).
   name: energy_full_band_u
-  # Four cloud draws give 12 off-diagonal U-statistic self-pairs per image.
-  # Together with batch_size=4 and two ranks this evaluates 32 paths/step.
   samples: 4
   sinkhorn_blur: 0.05
   full_band_levels: 3
@@ -113,16 +114,12 @@ loss:
   paired_deviation_weight: 1.0
   paired_variance_weight: 0.1
   perceptual_weight: 0.0
-  perceptual_pretrained: true
-  perceptual_stages: [1, 2, 3, 5]
-  perceptual_mean_weight: 1.0
-  perceptual_deviation_weight: 1.0
   spatial_ce_weight: 0.0
 
 train:
   epochs: 30
   learning_rate: 0.00002
-  lr_schedule: fixed
+  lr_schedule: cosine
   weight_decay: 0.0001
   grad_clip: 1.0
   amp: true
@@ -134,11 +131,9 @@ train:
   fused_optimizer: true
   compile: true
   compile_mode: reduce-overhead
-  seed: 31
-  # About 34 batch points per epoch (1,725 steps), enough to see oscillation
-  # without flooding TensorBoard with duplicate diagnostics.
+  seed: 37
   log_every: 50
-  preview_every: 200
-  save_every: 1000
-  output_dir: "/workspace/Cloud-Matching/outputs/l40_cnn_pooledkv_single_random_ustat_s4_scratch"
+  preview_every: 0
+  save_every: 0
+  output_dir: outputs/coco_text_fullres_d6
   resume: ""

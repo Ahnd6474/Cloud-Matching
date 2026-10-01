@@ -1,0 +1,102 @@
+data:
+  root: data/coco2017
+  prepared_root: ""
+  image_size: 16
+  batch_size: 2
+  workers: 0
+  prefetch_factor: 2
+  horizontal_flip: false
+
+text:
+  enabled: true
+  vocab_path: data/coco2017/coco_vocab.json
+  vocab_size: 16384
+  min_frequency: 2
+  max_length: 48
+  condition_dropout: 0.1
+  learning_rate_multiplier: 5.0
+
+schedule:
+  steps: 100
+  beta_start: 0.0001
+  beta_end: 0.02
+  answer_jump: 10
+  adaptive_answer_jump: true
+  near_clean_threshold: 20
+  near_clean_answer_jump: 2
+  mid_clean_threshold: 50
+  mid_clean_answer_jump: 5
+  near_clean_probability: 0.35
+  goal_from_clean: true
+  answer_from_current: true
+
+corruption:
+  enabled: false
+
+endpoint_corruption:
+  enabled: false
+  probability: 0.0
+
+goal_corruption:
+  enabled: false
+
+model:
+  architecture: fullres_axial
+  in_channels: 3
+  heads: 4
+  max_residual: 1.0
+  noise_variance_min: 0.0001
+  noise_variance_max: 2.0
+  noise_variance_init: 1.0
+  noise_energy_parameterization: fixed_unit
+  fullres_dim: 32
+  fullres_depth: 2
+  fullres_cross_depth: 1
+  fullres_cross_gate_init: 0.5
+  fullres_ffn_ratio: 1.0
+  fullres_window_size: 4
+  fullres_gradient_checkpointing: false
+  fullres_encoder_type: cvt
+  fullres_attention_type: cvt
+  fullres_pooled_kernel_sizes: [3, 5, 7]
+  fullres_pooled_output_sizes: [4, 2, 1]
+  fullres_random_attention: true
+  fullres_random_slots: 4
+  fullres_random_dim: 8
+  fullres_random_temperature: 1.0
+  fullres_random_gate1_init: 0.02
+  fullres_random_positions: [0]
+  fullres_goal_condition: text
+  text_vocab_size: 16384
+  text_max_length: 48
+  text_depth: 2
+  text_heads: 4
+  text_ffn_ratio: 2.0
+  text_dropout: 0.0
+
+loss:
+  name: energy_full_band_u
+  samples: 2
+  full_band_levels: 2
+  full_band_charbonnier_epsilon: 0.001
+  full_band_high_weight: 1.0
+  full_band_low_weight: 1.0
+  perceptual_weight: 0.0
+  spatial_ce_weight: 0.0
+
+train:
+  epochs: 1
+  learning_rate: 0.0001
+  lr_schedule: fixed
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  amp: false
+  amp_dtype: float16
+  channels_last: false
+  tf32: false
+  fused_optimizer: false
+  compile: false
+  seed: 37
+  log_every: 1
+  output_dir: runs/coco_text_smoke
+  resume: ""

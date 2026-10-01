@@ -2,12 +2,16 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from pathlib import Path
+import json
+import random
 
 import torch
 from PIL import Image
 from torch import Tensor
 from torch.utils.data import Dataset
 from torchvision import transforms
+from torchvision.transforms import functional as tvf
+from torch.nn import functional as F
 
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
@@ -119,3 +123,89 @@ class SyntheticImageDataset(Dataset[Tensor]):
         stripe = torch.sin((2 + index % 5) * torch.pi * x).clamp(-1.0, 1.0)
         diagonal = torch.tanh(3.0 * (x + y - 0.1 * (index % 5)))
         return torch.stack([circle, stripe, diagonal])
+
+
+class CocoCaptionDataset(Dataset[dict[str, Tensor | str | int]]):
+    """COCO images paired with one of their human-written captions.
+
+    Images are fitted inside a square instead of aggressively cropped because
+    COCO captions describe the whole scene. Padding is neutral gray in the
+    normalized model range and source files always remain at native resolution.
+    """
+
+    def __init__(
+        self,
+        image_root: str | Path,
+        captions_file: str | Path,
+        image_size: int,
+        *,
+        random_caption: bool = True,
+        horizontal_flip: bool = False,
+    ) -> None:
+        self.image_root = Path(image_root).expanduser().resolve()
+        self.captions_file = Path(captions_file).expanduser().resolve()
+        if not self.image_root.is_dir():
+            raise FileNotFoundError(f"COCO image directory does not exist: {self.image_root}")
+        if not self.captions_file.is_file():
+            raise FileNotFoundError(f"COCO captions file does not exist: {self.captions_file}")
+        if image_size < 1:
+            raise ValueError("image_size must be positive")
+        self.image_size = int(image_size)
+        self.random_caption = bool(random_caption)
+        self.horizontal_flip = bool(horizontal_flip)
+
+        raw = json.loads(self.captions_file.read_text(encoding="utf-8"))
+        captions_by_image: dict[int, list[str]] = {}
+        for annotation in raw.get("annotations", []):
+            image_id = int(annotation["image_id"])
+            caption = " ".join(str(annotation["caption"]).split())
+            if caption:
+                captions_by_image.setdefault(image_id, []).append(caption)
+
+        samples: list[tuple[Path, int, tuple[str, ...]]] = []
+        for image in raw.get("images", []):
+            image_id = int(image["id"])
+            captions = captions_by_image.get(image_id)
+            if not captions:
+                continue
+            path = self.image_root / str(image["file_name"])
+            if not path.is_file():
+                raise FileNotFoundError(f"COCO image listed by annotations is missing: {path}")
+            samples.append((path, image_id, tuple(captions)))
+        self.samples = sorted(samples, key=lambda item: item[1])
+        if not self.samples:
+            raise RuntimeError("COCO annotations contained no usable image-caption pairs")
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, index: int) -> dict[str, Tensor | str | int]:
+        path, image_id, captions = self.samples[index]
+        caption = random.choice(captions) if self.random_caption else captions[0]
+        with Image.open(path) as image:
+            clean = self._fit_square(image.convert("RGB"))
+        if self.horizontal_flip and random.random() < 0.5:
+            clean = clean.flip(-1)
+        return {"clean": clean, "caption": caption, "image_id": image_id}
+
+    def _fit_square(self, image: Image.Image) -> Tensor:
+        tensor = tvf.pil_to_tensor(image).float().div_(255.0)
+        height, width = tensor.shape[-2:]
+        scale = self.image_size / max(height, width)
+        resized_height = max(1, min(self.image_size, round(height * scale)))
+        resized_width = max(1, min(self.image_size, round(width * scale)))
+        tensor = tvf.resize(
+            tensor,
+            [resized_height, resized_width],
+            antialias=True,
+        )
+        pad_height = self.image_size - resized_height
+        pad_width = self.image_size - resized_width
+        left = pad_width // 2
+        right = pad_width - left
+        top = pad_height // 2
+        bottom = pad_height - top
+        # 0.5 maps to zero after normalization and therefore does not inject a
+        # strong black/white border into the denoising target.
+        tensor = F.pad(tensor, (left, right, top, bottom), value=0.5)
+        return normalize_image(tensor)

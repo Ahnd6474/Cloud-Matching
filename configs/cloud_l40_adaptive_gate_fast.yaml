@@ -88,8 +88,7 @@ model:
   fullres_random_dim: 64
   fullres_random_temperature: 0.8
   fullres_random_gate1_init: 0.02
-  fullres_random_gate2_init: 0.01
-  fullres_random_positions: [0, 4]
+  fullres_random_positions: [0]
 
 loss:
   name: energy_full_band

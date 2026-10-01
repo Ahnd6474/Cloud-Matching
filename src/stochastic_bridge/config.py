@@ -27,6 +27,19 @@ class DataConfig:
 
 
 @dataclass
+class TextConfig:
+    """Tokenizer and end-to-end text conditioning settings."""
+
+    enabled: bool = False
+    vocab_path: str = "data/coco2017/coco_vocab.json"
+    vocab_size: int = 16384
+    min_frequency: int = 2
+    max_length: int = 48
+    condition_dropout: float = 0.10
+    learning_rate_multiplier: float = 5.0
+
+
+@dataclass
 class PrepareConfig:
     variants_per_image: int = 4
     shard_size: int = 64
@@ -160,15 +173,33 @@ class ModelConfig:
     fullres_ffn_ratio: float = 2.0
     fullres_window_size: int = 8
     fullres_gradient_checkpointing: bool = True
+    fullres_encoder_type: str = "linear"
+    fullres_attention_type: str = "factorized"
+    fullres_pooled_kernel_sizes: list[int] = field(
+        default_factory=lambda: [3, 5, 7]
+    )
+    fullres_pooled_output_sizes: list[int] = field(
+        default_factory=lambda: [8, 4, 2]
+    )
     fullres_random_attention: bool = False
     fullres_random_slots: int = 64
     fullres_random_dim: int = 64
     fullres_random_temperature: float = 1.0
     fullres_random_gate1_init: float = 0.02
-    fullres_random_gate2_init: float = 0.01
-    # Insert each random-attention layer immediately before the self block at
-    # the corresponding index. An empty list preserves the legacy [0, D//2].
+    # Deprecated compatibility field. The second random-attention layer is gone.
+    fullres_random_gate2_init: float | None = None
+    # Insert the random-attention layer immediately before this self block.
+    # An empty list selects the first block.
     fullres_random_positions: list[int] = field(default_factory=list)
+    # ``text`` replaces the image goal with token IDs and learns the text
+    # encoder jointly with the image generator.
+    fullres_goal_condition: str = "image"
+    text_vocab_size: int = 16384
+    text_max_length: int = 48
+    text_depth: int = 4
+    text_heads: int = 8
+    text_ffn_ratio: float = 4.0
+    text_dropout: float = 0.1
 
 
 @dataclass
@@ -223,6 +254,7 @@ class TrainConfig:
 @dataclass
 class ExperimentConfig:
     data: DataConfig = field(default_factory=DataConfig)
+    text: TextConfig = field(default_factory=TextConfig)
     prepare: PrepareConfig = field(default_factory=PrepareConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
     corruption: CorruptionConfig = field(default_factory=CorruptionConfig)
@@ -247,6 +279,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
 def config_from_dict(raw: dict[str, Any]) -> ExperimentConfig:
     return ExperimentConfig(
         data=DataConfig(**raw.get("data", {})),
+        text=TextConfig(**raw.get("text", {})),
         prepare=PrepareConfig(**raw.get("prepare", {})),
         schedule=ScheduleConfig(**raw.get("schedule", {})),
         corruption=CorruptionConfig(**raw.get("corruption", {})),

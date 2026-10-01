@@ -512,7 +512,7 @@ def test_full_resolution_axial_bridge_is_pixel_aligned_and_trainable() -> None:
     )
 
 
-def test_full_resolution_random_attention_has_independent_trainable_layers() -> None:
+def test_full_resolution_cnn_encoder_and_single_random_attention_are_trainable() -> None:
     torch.manual_seed(41)
     model = StochasticImageBridge(
         architecture="fullres_axial",
@@ -528,19 +528,22 @@ def test_full_resolution_random_attention_has_independent_trainable_layers() -> 
         fullres_ffn_ratio=2.0,
         fullres_window_size=4,
         fullres_gradient_checkpointing=False,
+        fullres_encoder_type="cnn",
         fullres_random_attention=True,
         fullres_random_slots=8,
         fullres_random_dim=12,
         fullres_random_temperature=0.8,
         fullres_random_gate1_init=0.02,
-        fullres_random_gate2_init=0.01,
     )
-    first, second = model.fullres.random_attentions
-    assert model.fullres.random_positions == (0, 2)
+    assert len(model.fullres.random_attentions) == 1
+    first = model.fullres.random_attentions[0]
+    assert model.fullres.random_positions == (0,)
     torch.testing.assert_close(first.gate.detach(), torch.tensor(0.02))
-    torch.testing.assert_close(second.gate.detach(), torch.tensor(0.01))
-    assert first.key_projection.weight.data_ptr() != second.key_projection.weight.data_ptr()
-    assert first.value_projection.weight.data_ptr() != second.value_projection.weight.data_ptr()
+    assert model.fullres.encoder_type == "cnn"
+    assert any(
+        isinstance(module, torch.nn.Conv2d)
+        for module in model.fullres.image_encoder.modules()
+    )
 
     current = torch.randn(1, 3, 8, 8).clamp(-1.0, 1.0)
     goal = torch.randn(1, 3, 8, 8).clamp(-1.0, 1.0)
@@ -552,11 +555,44 @@ def test_full_resolution_random_attention_has_independent_trainable_layers() -> 
     assert cloud.std(dim=1).mean().item() > 0.0
 
     cloud.square().mean().backward()
-    for layer in model.fullres.random_attentions:
-        assert layer.gate.grad is not None
-        assert layer.gate.grad.abs().item() > 0.0
-        assert layer.key_projection.weight.grad is not None
-        assert layer.value_projection.weight.grad is not None
+    assert first.gate.grad is not None
+    assert first.gate.grad.abs().item() > 0.0
+    assert first.key_projection.weight.grad is not None
+    assert first.value_projection.weight.grad is not None
+    assert model.fullres.image_encoder.input_projection.weight.grad is not None
+
+
+def test_full_resolution_cnn_init_migrates_legacy_linear_and_drops_random_two() -> None:
+    common = {
+        "architecture": "fullres_axial",
+        "in_channels": 3,
+        "heads": 4,
+        "noise_variance_min": 1e-4,
+        "noise_variance_max": 2.0,
+        "noise_variance_init": 1.0,
+        "noise_energy_parameterization": "fixed_unit",
+        "fullres_dim": 32,
+        "fullres_depth": 4,
+        "fullres_cross_depth": 1,
+        "fullres_window_size": 4,
+        "fullres_gradient_checkpointing": False,
+        "fullres_random_attention": True,
+        "fullres_random_slots": 8,
+        "fullres_random_dim": 12,
+    }
+    legacy = StochasticImageBridge(**common, fullres_encoder_type="linear")
+    legacy_state = legacy.state_dict()
+    for name, value in tuple(legacy_state.items()):
+        if name.startswith("fullres.random_attentions.0."):
+            legacy_state[name.replace(".0.", ".1.")] = value.clone()
+
+    cnn = StochasticImageBridge(**common, fullres_encoder_type="cnn")
+    incompatible = cnn.load_state_dict(legacy_state, strict=False)
+
+    assert not incompatible.unexpected_keys
+    assert all(name.startswith("fullres.image_encoder.") for name in incompatible.missing_keys)
+    center = cnn.fullres.image_encoder.input_projection.weight[:, :, 1, 1]
+    torch.testing.assert_close(center, legacy.fullres.pixel_embed.weight)
 
 
 def test_full_resolution_cross_attention_has_learned_spatial_gates() -> None:
@@ -584,6 +620,128 @@ def test_full_resolution_cross_attention_has_learned_spatial_gates() -> None:
     goal = torch.randn(1, 3, 8, 8)
     model(current, goal, samples=2).square().mean().backward()
     assert all(projection.weight.grad is not None for projection in block.gate_projections)
+
+
+def test_multiscale_cvt_attention_keeps_full_resolution_and_reduces_kv() -> None:
+    torch.manual_seed(43)
+    model = StochasticImageBridge(
+        architecture="fullres_axial",
+        in_channels=3,
+        heads=4,
+        noise_variance_min=1e-4,
+        noise_variance_max=2.0,
+        noise_variance_init=1.0,
+        noise_energy_parameterization="fixed_unit",
+        fullres_dim=32,
+        fullres_depth=2,
+        fullres_cross_depth=1,
+        fullres_ffn_ratio=2.0,
+        fullres_gradient_checkpointing=False,
+        fullres_encoder_type="cnn",
+        fullres_attention_type="cvt",
+        fullres_pooled_kernel_sizes=[3, 5, 7],
+        fullres_pooled_output_sizes=[8, 4, 2],
+    )
+    current = torch.randn(1, 3, 10, 14).clamp(-1.0, 1.0)
+    goal = torch.randn(1, 3, 10, 14).clamp(-1.0, 1.0)
+    cloud = model(current, goal, samples=2)
+
+    assert cloud.shape == (1, 2, 3, 10, 14)
+    assert model.fullres.attention_type == "cvt"
+    cross_attention = model.fullres.cross_blocks[0].attentions[0]
+    assert cross_attention.pooled_token_count(10, 14) == 84
+    condition, _ = model.encode_condition(current, goal)
+    pooled = cross_attention.pool_context(condition.permute(0, 2, 3, 1))
+    assert pooled.shape == (1, 84, 32)
+
+    cloud.square().mean().backward()
+    assert cross_attention.context_convolutions[0].weight.grad is not None
+    assert cross_attention.attention.in_proj_weight.grad is not None
+    assert model.fullres.blocks[0].attention.context_convolutions[2].weight.grad is not None
+
+
+def test_multiscale_cvt_attention_validates_scale_configuration() -> None:
+    with pytest.raises(ValueError, match="equally sized"):
+        StochasticImageBridge(
+            architecture="fullres_axial",
+            heads=2,
+            fullres_dim=16,
+            fullres_depth=1,
+            fullres_cross_depth=1,
+            fullres_attention_type="cvt",
+            fullres_pooled_kernel_sizes=[3, 5, 7],
+            fullres_pooled_output_sizes=[8, 4],
+        )
+
+
+def test_legacy_pooled_names_are_checkpoint_compatible_cvt_aliases() -> None:
+    common = dict(
+        architecture="fullres_axial",
+        heads=2,
+        noise_energy_parameterization="fixed_unit",
+        fullres_dim=16,
+        fullres_depth=1,
+        fullres_cross_depth=1,
+        fullres_gradient_checkpointing=False,
+        fullres_pooled_kernel_sizes=[3, 5, 7],
+        fullres_pooled_output_sizes=[4, 2, 1],
+    )
+    canonical = StochasticImageBridge(
+        **common,
+        fullres_encoder_type="cvt",
+        fullres_attention_type="cvt",
+    )
+    legacy = StochasticImageBridge(
+        **common,
+        fullres_encoder_type="pooled_attention",
+        fullres_attention_type="pooled_multiscale",
+    )
+    legacy.load_state_dict(canonical.state_dict())
+
+    assert legacy.fullres.encoder_type == "cvt"
+    assert legacy.fullres.attention_type == "cvt"
+    current = torch.randn(1, 3, 7, 9).clamp(-1.0, 1.0)
+    goal = torch.randn(1, 3, 7, 9).clamp(-1.0, 1.0)
+    noise = torch.randn(1, 2, 3, 7, 9)
+    torch.testing.assert_close(
+        legacy(current, goal, samples=2, noise=noise),
+        canonical(current, goal, samples=2, noise=noise),
+    )
+
+
+def test_full_resolution_cvt_encoder_is_shared_and_trainable() -> None:
+    torch.manual_seed(47)
+    model = StochasticImageBridge(
+        architecture="fullres_axial",
+        in_channels=3,
+        heads=4,
+        noise_variance_min=1e-4,
+        noise_variance_max=2.0,
+        noise_variance_init=1.0,
+        noise_energy_parameterization="fixed_unit",
+        fullres_dim=32,
+        fullres_depth=1,
+        fullres_cross_depth=1,
+        fullres_gradient_checkpointing=False,
+        fullres_encoder_type="cvt",
+        fullres_attention_type="cvt",
+        fullres_pooled_kernel_sizes=[3, 5, 7],
+        fullres_pooled_output_sizes=[8, 4, 2],
+    )
+    current = torch.randn(2, 3, 9, 13).clamp(-1.0, 1.0)
+    goal = torch.randn(2, 3, 9, 13).clamp(-1.0, 1.0)
+    cloud = model(current, goal, samples=2)
+
+    assert cloud.shape == (2, 2, 3, 9, 13)
+    assert model.fullres.encoder_type == "cvt"
+    encoder = model.fullres.image_encoder
+    assert encoder.attention.pooled_token_count(9, 13) == 84
+
+    cloud.square().mean().backward()
+    assert encoder.input_projection.weight.grad is not None
+    assert encoder.attention.context_convolutions[1].weight.grad is not None
+    assert encoder.attention.attention.in_proj_weight.grad is not None
+    assert encoder.attention_gate.grad is not None
 
 
 def test_softplus_amplitude_energy_has_no_legacy_sigmoid_ceiling() -> None:
@@ -677,3 +835,66 @@ def test_full_band_energy_detects_pixel_scale_variation() -> None:
         predicted, target, current
     )
     assert loss.item() > 0.0
+
+
+def test_full_resolution_text_goal_is_end_to_end_trainable() -> None:
+    model = StochasticImageBridge(
+        architecture="fullres_axial",
+        heads=4,
+        noise_energy_parameterization="fixed_unit",
+        fullres_dim=32,
+        fullres_depth=2,
+        fullres_cross_depth=1,
+        fullres_ffn_ratio=1.0,
+        fullres_gradient_checkpointing=False,
+        fullres_encoder_type="cvt",
+        fullres_attention_type="cvt",
+        fullres_pooled_kernel_sizes=[3, 5, 7],
+        fullres_pooled_output_sizes=[4, 2, 1],
+        fullres_random_attention=True,
+        fullres_random_slots=4,
+        fullres_random_dim=8,
+        fullres_goal_condition="text",
+        text_vocab_size=32,
+        text_max_length=8,
+        text_depth=2,
+        text_heads=4,
+        text_ffn_ratio=2.0,
+        text_dropout=0.0,
+    )
+    current = torch.randn(2, 3, 8, 8).clamp(-1.0, 1.0)
+    token_ids = torch.tensor(
+        [[1, 4, 5, 2, 0, 0, 0, 0], [1, 6, 7, 8, 2, 0, 0, 0]],
+        dtype=torch.long,
+    )
+    token_mask = token_ids.ne(0)
+    cloud = model(
+        current,
+        token_ids,
+        samples=2,
+        goal_mask=token_mask,
+    )
+    assert cloud.shape == (2, 2, 3, 8, 8)
+    cloud.square().mean().backward()
+    gradient = model.fullres.text_encoder.embedding.weight.grad
+    assert gradient is not None
+    assert gradient.abs().sum().item() > 0.0
+
+
+def test_text_goal_rejects_image_tensor() -> None:
+    model = StochasticImageBridge(
+        architecture="fullres_axial",
+        heads=2,
+        fullres_dim=16,
+        fullres_depth=1,
+        fullres_cross_depth=1,
+        fullres_gradient_checkpointing=False,
+        fullres_goal_condition="text",
+        text_vocab_size=16,
+        text_max_length=8,
+        text_depth=1,
+        text_heads=2,
+    )
+    current = torch.randn(1, 3, 8, 8)
+    with pytest.raises(ValueError, match="text goal"):
+        model(current, torch.randn_like(current), samples=1)
