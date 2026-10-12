@@ -1,0 +1,71 @@
+data:
+  prepared_root: ""
+  synthetic: true
+  synthetic_length: 8
+  image_size: 32
+  batch_size: 2
+  workers: 0
+
+schedule:
+  steps: 100
+  answer_jump: 10
+  clean_answer_probability: 1.0
+
+corruption:
+  enabled: false
+
+endpoint_corruption:
+  enabled: false
+  probability: 0.0
+
+goal_corruption:
+  enabled: true
+  blur_probability: 1.0
+  downsample_probability: 1.0
+  mask_probability: 0.15
+  minimum_scale: 0.25
+  maximum_mask_fraction: 0.20
+
+model:
+  architecture: fullres_axial
+  in_channels: 3
+  heads: 4
+  noise_energy_parameterization: fixed_unit
+  fullres_dim: 32
+  fullres_depth: 2
+  fullres_cross_depth: 1
+  fullres_ffn_ratio: 1.0
+  fullres_window_size: 4
+  fullres_gradient_checkpointing: false
+  fullres_encoder_type: cvt
+  fullres_attention_type: cvt
+  fullres_pooled_kernel_sizes: [3, 5, 7]
+  fullres_pooled_output_sizes: [4, 2, 1]
+  fullres_random_attention: true
+  fullres_random_slots: 8
+  fullres_random_dim: 16
+  fullres_random_temperature: 0.8
+  fullres_random_gate1_init: 0.02
+  fullres_hidden_loop_steps: 2
+  fullres_hidden_anchor_gate_init: 0.02
+  fullres_absolute_decoder_dim: 16
+  fullres_hidden_intermediate_depth: 1
+
+loss:
+  name: paired_mean_deviation_full_band
+  samples: 2
+  full_band_levels: 2
+  hidden_consistency_weight: 0.1
+
+train:
+  epochs: 1
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  amp: false
+  fused_optimizer: false
+  compile: false
+  log_every: 1
+  preview_every: 100
+  save_every: 100
+  output_dir: outputs/local_hidden_loop_smoke

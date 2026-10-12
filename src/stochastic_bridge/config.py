@@ -194,6 +194,14 @@ class ModelConfig:
     # Insert the random-attention layer immediately before this self block.
     # An empty list selects the first block.
     fullres_random_positions: list[int] = field(default_factory=list)
+    # Encoder-anchored Cloud Matching loop. Zero preserves the original
+    # image-relative one-step decoder. Positive values encode current/goal once,
+    # run this many hidden updates, and decode the final hidden grid absolutely.
+    fullres_hidden_loop_steps: int = 0
+    fullres_hidden_anchor_gate_init: float = 0.02
+    fullres_absolute_decoder_dim: int = 64
+    # -1 runs every refinement block in intermediate hidden steps.
+    fullres_hidden_intermediate_depth: int = -1
     # ``text`` replaces the image goal with token IDs and learns the text
     # encoder jointly with the image generator.
     fullres_goal_condition: str = "image"
@@ -228,6 +236,9 @@ class LossConfig:
     spatial_ce_weight: float = 0.0
     spatial_ce_highpass: bool = True
     spatial_ce_kernel_size: int = 5
+    # Pull each recurrent hidden state toward the encoder manifold E(D(h)).
+    # The re-encoded target is detached; gradients update only the rollout path.
+    hidden_consistency_weight: float = 0.0
 
 
 @dataclass

@@ -260,6 +260,7 @@ def validate(
     perceptual_weight: float,
     spatial_criterion: SpatialNoiseCrossEntropyLoss | None,
     spatial_ce_weight: float,
+    hidden_consistency_weight: float,
     paired: bool,
     device: torch.device,
     samples: int,
@@ -273,7 +274,7 @@ def validate(
     model.eval()
     # loss, input/output PSNR, mean energy, count, cloud/spatial loss,
     # and per-image spatial-energy p50/p95/p99/max.
-    totals = torch.zeros(25, device=device)
+    totals = torch.zeros(26, device=device)
     energy_quantile_levels = torch.tensor([0.50, 0.95, 0.99], device=device)
     for batch_index, raw in enumerate(loader):
         if max_batches and batch_index >= max_batches:
@@ -284,16 +285,18 @@ def validate(
             dtype=torch.float16,
             enabled=amp_enabled,
         ):
+            request_energy = (
+                spatial_criterion is not None
+                or getattr(model, "architecture", "") == "fullres_axial"
+            )
             model_output = model(
                 batch["current"],
                 batch["goal"],
                 samples=samples,
                 noise=batch["target_noise"] if paired else None,
                 return_noise_variance=True,
-                return_noise_energy=(
-                    spatial_criterion is not None
-                    or getattr(model, "architecture", "") == "fullres_axial"
-                ),
+                return_noise_energy=request_energy,
+                return_hidden_consistency=hidden_consistency_weight > 0.0,
             )
             if not isinstance(model_output, tuple):
                 raise RuntimeError("model did not return its noise variance")
@@ -312,17 +315,22 @@ def validate(
                 spatial_loss = spatial_criterion(
                     model_output[2], batch["target_cloud"], batch["current"]
                 )
+            hidden_consistency_loss = cloud_loss.new_zeros(())
+            if hidden_consistency_weight > 0.0:
+                consistency_index = 3 if request_energy else 2
+                hidden_consistency_loss = model_output[consistency_index].mean()
             loss = (
                 cloud_loss
                 + perceptual_weight * perceptual_loss
                 + spatial_ce_weight * spatial_loss
+                + hidden_consistency_weight * hidden_consistency_loss
             )
         if batch_index == 0 and writer is not None and validation_images > 0:
             log_validation_images(
                 writer,
                 batch,
                 predicted,
-                model_output[2] if len(model_output) == 3 else None,
+                model_output[2] if request_energy else None,
                 epoch,
                 validation_images,
             )
@@ -335,7 +343,7 @@ def validate(
         clean_count = clean_endpoint.sum()
         transition_count = transition_endpoint.sum()
         energy_per_image = noise_variance.detach().float().flatten()
-        if len(model_output) == 3:
+        if request_energy:
             energy_flat = model_output[2].detach().float().flatten(1)
             energy_quantiles = torch.quantile(
                 energy_flat,
@@ -373,6 +381,7 @@ def validate(
                 energy_per_image[transition_endpoint].sum(),
                 transition_count.float(),
                 perceptual_loss.float() * count,
+                hidden_consistency_loss.float() * count,
             ],
         )
     model.train()
@@ -405,6 +414,7 @@ def validate(
         "val_transition_noise_variance": totals[22].item()
         / transition_denominator,
         "val_perceptual_loss": totals[24].item() / denominator,
+        "val_hidden_consistency_mse": totals[25].item() / denominator,
     }
 
 
@@ -587,6 +597,13 @@ def main() -> None:
         raise ValueError(
             "loss.spatial_ce_weight requires model.architecture=fullres_axial"
         )
+    if (
+        config.loss.hidden_consistency_weight > 0.0
+        and config.model.fullres_hidden_loop_steps < 1
+    ):
+        raise ValueError(
+            "loss.hidden_consistency_weight requires a full-resolution hidden loop"
+        )
     optimizer = torch.optim.AdamW(
         adamw_parameter_groups(model, config.train.weight_decay),
         lr=config.train.learning_rate,
@@ -628,6 +645,11 @@ def main() -> None:
             and config.model.fullres_random_attention
             and not source_random_attention
         )
+        adding_hidden_loop = (
+            config.model.architecture == "fullres_axial"
+            and config.model.fullres_hidden_loop_steps > 0
+            and int(source_model_config.get("fullres_hidden_loop_steps", 0)) == 0
+        )
         adding_cnn_encoder = (
             config.model.architecture == "fullres_axial"
             and config.model.fullres_encoder_type == "cnn"
@@ -637,6 +659,14 @@ def main() -> None:
         allowed_missing_prefixes = ["fullres.cross_blocks."]
         if adding_random_attention:
             allowed_missing_prefixes.append("fullres.random_attentions.")
+        if adding_hidden_loop:
+            allowed_missing_prefixes.extend(
+                (
+                    "fullres.hidden_random_attention.",
+                    "fullres.state_update.",
+                    "fullres.absolute_output_head.",
+                )
+            )
         if adding_cnn_encoder:
             allowed_missing_prefixes.append("fullres.image_encoder.local_refinement.")
             allowed_missing_prefixes.append("fullres.image_encoder.local_gate")
@@ -676,6 +706,11 @@ def main() -> None:
             print(
                 "expanded the pixel-linear weights into the CNN center kernel; "
                 "initialized the local refinement branch from scratch"
+            )
+        if adding_hidden_loop and is_main:
+            print(
+                "initialized the hidden random attention, encoder-state update, "
+                "and absolute decoder while loading compatible backbone weights"
             )
         if is_main and any(
             "gate_projections" in name for name in incompatible.missing_keys
@@ -776,7 +811,7 @@ def main() -> None:
         train_model.train()
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
-        totals = torch.zeros(13, device=device)
+        totals = torch.zeros(14, device=device)
         progress = tqdm(
             train_loader,
             desc=f"epoch {epoch + 1}/{config.train.epochs}",
@@ -816,6 +851,9 @@ def main() -> None:
                     noise=batch["target_noise"] if paired else None,
                     return_noise_variance=True,
                     return_noise_energy=spatial_criterion is not None,
+                    return_hidden_consistency=(
+                        config.loss.hidden_consistency_weight > 0.0
+                    ),
                 )
                 if not isinstance(model_output, tuple):
                     raise RuntimeError("model did not return its noise variance")
@@ -834,10 +872,16 @@ def main() -> None:
                     spatial_loss = spatial_criterion(
                         model_output[2], batch["target_cloud"], batch["current"]
                     )
+                hidden_consistency_loss = cloud_loss.new_zeros(())
+                if config.loss.hidden_consistency_weight > 0.0:
+                    consistency_index = 3 if spatial_criterion is not None else 2
+                    hidden_consistency_loss = model_output[consistency_index].mean()
                 loss = (
                     cloud_loss
                     + config.loss.perceptual_weight * perceptual_loss
                     + config.loss.spatial_ce_weight * spatial_loss
+                    + config.loss.hidden_consistency_weight
+                    * hidden_consistency_loss
                 )
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -868,6 +912,7 @@ def main() -> None:
                     predicted_diversity.sum(),
                     target_diversity.sum(),
                     perceptual_loss.detach().float() * count,
+                    hidden_consistency_loss.detach().float() * count,
                 ]
             )
             if is_main and (batch_index + 1) % config.train.log_every == 0:
@@ -902,6 +947,12 @@ def main() -> None:
                     writer.add_scalar(
                         "batch/spatial_ce_contribution",
                         config.loss.spatial_ce_weight * spatial_loss.item(),
+                        global_step,
+                    )
+                if config.loss.hidden_consistency_weight > 0.0:
+                    writer.add_scalar(
+                        "batch/hidden_consistency_mse",
+                        hidden_consistency_loss.item(),
                         global_step,
                     )
                 if config.model.noise_energy_parameterization != "fixed_unit":
@@ -943,6 +994,7 @@ def main() -> None:
             "train_predicted_diversity": totals[10].item() / count,
             "train_target_diversity": totals[11].item() / count,
             "train_perceptual_loss": totals[12].item() / count,
+            "train_hidden_consistency_mse": totals[13].item() / count,
             "learning_rate": optimizer.param_groups[0]["lr"],
             "train_peak_allocated_gib": train_peak_allocated_gib,
             "train_peak_reserved_gib": train_peak_reserved_gib,
@@ -991,6 +1043,7 @@ def main() -> None:
                     config.loss.perceptual_weight,
                     spatial_criterion,
                     config.loss.spatial_ce_weight,
+                    config.loss.hidden_consistency_weight,
                     paired,
                     device,
                     config.loss.samples,

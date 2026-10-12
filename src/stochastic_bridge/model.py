@@ -797,6 +797,7 @@ class FullResolutionRandomAttention(nn.Module):
         random_dim: int,
         temperature: float,
         gate_init: float,
+        gated: bool = False,
     ) -> None:
         super().__init__()
         if dim % heads:
@@ -805,6 +806,8 @@ class FullResolutionRandomAttention(nn.Module):
             raise ValueError("random_dim must be positive")
         if temperature <= 0.0:
             raise ValueError("random-attention temperature must be positive")
+        if gated and not 0.0 < gate_init < 1.0:
+            raise ValueError("gated random attention init must lie in (0, 1)")
         self.dim = dim
         self.heads = heads
         self.head_dim = dim // heads
@@ -818,9 +821,21 @@ class FullResolutionRandomAttention(nn.Module):
         self.key_norm = nn.LayerNorm(dim, elementwise_affine=False)
         self.value_norm = nn.LayerNorm(dim, elementwise_affine=False)
         self.output_projection = nn.Linear(dim, dim, bias=False)
-        self.gate = nn.Parameter(torch.tensor(float(gate_init)))
+        self.gated = gated
+        if gated:
+            self.gate_projection = nn.Linear(dim, dim)
+            gate_logit = math.log(gate_init / (1.0 - gate_init))
+            nn.init.zeros_(self.gate_projection.weight)
+            nn.init.constant_(self.gate_projection.bias, gate_logit)
+        else:
+            self.gate = nn.Parameter(torch.tensor(float(gate_init)))
 
-    def forward(self, query: Tensor, random_tokens: Tensor) -> Tensor:
+    def forward(
+        self,
+        query: Tensor,
+        random_tokens: Tensor,
+        spatial_amplitude: Tensor | None = None,
+    ) -> Tensor:
         if query.ndim != 4:
             raise ValueError("query must have shape [B,H,W,C]")
         if random_tokens.ndim != 3:
@@ -834,8 +849,15 @@ class FullResolutionRandomAttention(nn.Module):
             raise ValueError(
                 f"random token dimension must be {self.random_dim}"
             )
+        if spatial_amplitude is not None and spatial_amplitude.shape != (
+            batch,
+            height,
+            width,
+        ):
+            raise ValueError("spatial_amplitude must have shape [B,H,W]")
 
-        query_flat = self.query_projection(self.query_norm(query)).reshape(
+        normalized_query = self.query_norm(query)
+        query_flat = self.query_projection(normalized_query).reshape(
             batch, height * width, self.heads, self.head_dim
         )
         key = self.key_norm(self.key_projection(random_tokens)).reshape(
@@ -858,7 +880,105 @@ class FullResolutionRandomAttention(nn.Module):
             attended.permute(0, 2, 1, 3)
             .reshape(batch, height, width, dim)
         )
-        return query + self.gate * self.output_projection(attended)
+        candidate = self.output_projection(attended)
+        if self.gated:
+            gate = torch.sigmoid(self.gate_projection(normalized_query))
+        else:
+            gate = self.gate
+        update = gate * candidate
+        if spatial_amplitude is not None:
+            update = update * spatial_amplitude[..., None]
+        return query + update
+
+
+class EncoderAnchoredHiddenUpdate(nn.Module):
+    """Let an encoder state query a proposed model state and GLU-gate its update."""
+
+    def __init__(
+        self,
+        dim: int,
+        heads: int,
+        gate_init: float,
+        kernel_sizes: list[int] | tuple[int, ...],
+        output_sizes: list[int] | tuple[int, ...],
+    ) -> None:
+        super().__init__()
+        if not 0.0 < gate_init < 1.0:
+            raise ValueError("hidden anchor gate init must lie between zero and one")
+        self.query_norm = nn.LayerNorm(dim)
+        self.context_norm = nn.LayerNorm(dim)
+        self.attention = MultiscaleCvTAttention2d(
+            dim,
+            heads,
+            kernel_sizes,
+            output_sizes,
+        )
+        self.candidate_projection = nn.Linear(dim, dim, bias=False)
+        self.candidate_norm = nn.RMSNorm(dim)
+        self.gate_projection = nn.Linear(dim, dim, bias=False)
+        self.gate_bias = nn.Parameter(
+            torch.full((dim,), math.log(gate_init / (1.0 - gate_init)))
+        )
+        nn.init.eye_(self.candidate_projection.weight)
+        nn.init.zeros_(self.gate_projection.weight)
+
+    def forward(
+        self,
+        encoder_hidden: Tensor,
+        model_hidden: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        if encoder_hidden.ndim != 4 or model_hidden.shape != encoder_hidden.shape:
+            raise ValueError(
+                "encoder_hidden and model_hidden must share shape [B,H,W,D]"
+            )
+        cross_update = self.attention(
+            self.query_norm(encoder_hidden),
+            self.context_norm(model_hidden),
+        )
+        candidate = self.candidate_norm(
+            self.candidate_projection(cross_update)
+        )
+        gate = torch.sigmoid(self.gate_projection(cross_update) + self.gate_bias)
+        update = gate * candidate
+        return encoder_hidden + update, gate, update
+
+
+class AbsoluteImageHead(nn.Module):
+    """Decode an encoder-grid vector directly to an absolute RGB image."""
+
+    def __init__(self, dim: int, image_channels: int, hidden_dim: int) -> None:
+        super().__init__()
+        if hidden_dim < 1:
+            raise ValueError("absolute decoder hidden dimension must be positive")
+        self.direct_projection = nn.Conv2d(dim, image_channels, kernel_size=1)
+        self.norm = nn.LayerNorm(dim)
+        self.input_projection = nn.Conv2d(
+            dim, hidden_dim, kernel_size=3, padding=1
+        )
+        self.spatial_mixer = nn.Conv2d(
+            hidden_dim,
+            hidden_dim,
+            kernel_size=3,
+            padding=1,
+            groups=hidden_dim,
+        )
+        self.output_projection = nn.Conv2d(
+            hidden_dim, image_channels, kernel_size=1
+        )
+        nn.init.normal_(self.direct_projection.weight, std=1e-3)
+        nn.init.zeros_(self.direct_projection.bias)
+        nn.init.normal_(self.output_projection.weight, std=1e-3)
+        nn.init.zeros_(self.output_projection.bias)
+
+    def forward(self, hidden: Tensor) -> Tensor:
+        if hidden.ndim != 4:
+            raise ValueError("hidden must have shape [B,H,W,D]")
+        channels_first = hidden.permute(0, 3, 1, 2)
+        direct = self.direct_projection(channels_first)
+        normalized = self.norm(hidden).permute(0, 3, 1, 2)
+        value = F.gelu(self.input_projection(normalized))
+        value = F.gelu(value + self.spatial_mixer(value))
+        return torch.tanh(direct + self.output_projection(value))
 
 
 class FullResolutionConvEncoder(nn.Module):
@@ -953,6 +1073,10 @@ class FullResolutionAxialCore(nn.Module):
         random_temperature: float,
         random_gate1_init: float,
         random_positions: list[int] | tuple[int, ...],
+        hidden_loop_steps: int,
+        hidden_anchor_gate_init: float,
+        absolute_decoder_dim: int,
+        hidden_intermediate_depth: int,
         goal_condition: str,
         text_vocab_size: int,
         text_max_length: int,
@@ -978,6 +1102,14 @@ class FullResolutionAxialCore(nn.Module):
             raise ValueError("fullres_random_dim must be positive")
         if random_temperature <= 0.0:
             raise ValueError("fullres_random_temperature must be positive")
+        if hidden_loop_steps < 0:
+            raise ValueError("fullres_hidden_loop_steps must be non-negative")
+        if hidden_loop_steps and not random_attention:
+            raise ValueError("the hidden loop requires fullres_random_attention")
+        if hidden_intermediate_depth < -1 or hidden_intermediate_depth > depth:
+            raise ValueError(
+                "fullres_hidden_intermediate_depth must be -1 or within refinement depth"
+            )
         self.in_channels = in_channels
         self.dim = dim
         self.max_residual = max_residual
@@ -1002,6 +1134,10 @@ class FullResolutionAxialCore(nn.Module):
         self.random_attention_enabled = random_attention
         self.random_slots = random_slots
         self.random_dim = random_dim
+        self.hidden_loop_steps = hidden_loop_steps
+        self.hidden_intermediate_depth = (
+            depth if hidden_intermediate_depth == -1 else hidden_intermediate_depth
+        )
         if random_positions:
             if len(random_positions) not in {1, 2}:
                 raise ValueError("fullres_random_positions must contain one index")
@@ -1113,6 +1249,27 @@ class FullResolutionAxialCore(nn.Module):
         self.output_head = nn.Linear(dim, in_channels)
         nn.init.normal_(self.output_head.weight, std=1e-3)
         nn.init.zeros_(self.output_head.bias)
+        if self.hidden_loop_steps:
+            self.hidden_random_attention = FullResolutionRandomAttention(
+                dim,
+                heads,
+                random_dim,
+                random_temperature,
+                random_gate1_init,
+                gated=True,
+            )
+            self.state_update = EncoderAnchoredHiddenUpdate(
+                dim,
+                heads,
+                hidden_anchor_gate_init,
+                pooled_kernel_sizes,
+                pooled_output_sizes,
+            )
+            self.absolute_output_head = AbsoluteImageHead(
+                dim,
+                in_channels,
+                absolute_decoder_dim,
+            )
 
     def reset_energy_head(self, initial_energy: float) -> None:
         """Reset only the sampler scale when changing its parameterization."""
@@ -1140,12 +1297,13 @@ class FullResolutionAxialCore(nn.Module):
         nn.init.zeros_(self.energy_head.weight)
         nn.init.constant_(self.energy_head.bias, energy_bias)
 
-    def encode_condition(
+    def encode_anchor_context(
         self,
         current: Tensor,
         goal: Tensor,
         goal_mask: Tensor | None = None,
-    ) -> Tensor:
+    ) -> tuple[Tensor, Tensor]:
+        """Encode the immutable image anchor and reusable goal context once."""
         batch, _, height, width = current.shape
         if self.encoder_type == "linear":
             current_tokens = self.pixel_embed(current.permute(0, 2, 3, 1))
@@ -1166,29 +1324,64 @@ class FullResolutionAxialCore(nn.Module):
         current_tokens = current_tokens + position
         if self.goal_condition == "text":
             goal_tokens = self.text_encoder(goal, goal_mask).to(current_tokens.dtype)
+        else:
+            goal_tokens = goal_tokens + position
+        return current_tokens, goal_tokens
+
+    def encode_image_anchor(self, image: Tensor) -> Tensor:
+        """Encode one image as the manifold reference used by the hidden loop."""
+        _, _, height, width = image.shape
+        if self.encoder_type == "linear":
+            hidden = self.pixel_embed(image.permute(0, 2, 3, 1))
+        else:
+            hidden = self.image_encoder(image)
+        position = _sinusoidal_2d_position(
+            height, width, self.dim, image.device, image.dtype
+        ).reshape(1, height, width, self.dim)
+        return hidden + position
+
+    def condition_hidden(
+        self,
+        hidden: Tensor,
+        goal_context: Tensor,
+        goal_mask: Tensor | None = None,
+    ) -> Tensor:
+        """Let a hidden state query the fixed goal context through the backbone."""
+        tokens = hidden
+        if self.goal_condition == "text":
             for block in self.cross_blocks:
                 if self.gradient_checkpointing and self.training:
-                    current_tokens = checkpoint(
+                    tokens = checkpoint(
                         block,
-                        current_tokens,
-                        goal_tokens,
+                        tokens,
+                        goal_context,
                         goal_mask,
                         use_reentrant=False,
                     )
                 else:
-                    current_tokens = block(current_tokens, goal_tokens, goal_mask)
+                    tokens = block(tokens, goal_context, goal_mask)
         else:
-            goal_tokens = goal_tokens + position
             for block in self.cross_blocks:
                 if self.gradient_checkpointing and self.training:
-                    current_tokens = checkpoint(
-                        block, current_tokens, goal_tokens, use_reentrant=False
+                    tokens = checkpoint(
+                        block, tokens, goal_context, use_reentrant=False
                     )
                 else:
-                    current_tokens = block(current_tokens, goal_tokens)
-        if current_tokens.shape != (batch, height, width, self.dim):
+                    tokens = block(tokens, goal_context)
+        if tokens.shape != hidden.shape:
             raise RuntimeError("full-resolution condition changed spatial shape")
-        return current_tokens
+        return tokens
+
+    def encode_condition(
+        self,
+        current: Tensor,
+        goal: Tensor,
+        goal_mask: Tensor | None = None,
+    ) -> Tensor:
+        anchor, goal_context = self.encode_anchor_context(
+            current, goal, goal_mask
+        )
+        return self.condition_hidden(anchor, goal_context, goal_mask)
 
     def spatial_energy(self, condition: Tensor) -> Tensor:
         if self.noise_energy_parameterization == "fixed_unit":
@@ -1279,6 +1472,156 @@ class FullResolutionAxialCore(nn.Module):
             self.random_dim,
         )
 
+    def _refine_tokens(
+        self,
+        tokens: Tensor,
+        random_memory: Tensor | None,
+        depth: int | None = None,
+        hidden_loop: bool = False,
+        spatial_amplitude: Tensor | None = None,
+    ) -> Tensor:
+        block_count = len(self.blocks) if depth is None else depth
+        random_index = 0
+        for index in range(block_count + 1):
+            while (
+                self.random_attention_enabled
+                and random_index < len(self.random_positions)
+                and (
+                    (hidden_loop and index == 0)
+                    or (not hidden_loop and self.random_positions[random_index] == index)
+                )
+            ):
+                if random_memory is None:
+                    raise RuntimeError("random attention requires random memory")
+                random_layer = (
+                    self.hidden_random_attention
+                    if hidden_loop
+                    else self.random_attentions[random_index]
+                )
+                if self.gradient_checkpointing and self.training:
+                    if hidden_loop:
+                        tokens = checkpoint(
+                            random_layer,
+                            tokens,
+                            random_memory,
+                            spatial_amplitude,
+                            use_reentrant=False,
+                        )
+                    else:
+                        tokens = checkpoint(
+                            random_layer,
+                            tokens,
+                            random_memory,
+                            use_reentrant=False,
+                        )
+                else:
+                    tokens = random_layer(
+                        tokens,
+                        random_memory,
+                        spatial_amplitude if hidden_loop else None,
+                    )
+                random_index += 1
+            if index == block_count:
+                break
+            block = self.blocks[index]
+            if self.gradient_checkpointing and self.training:
+                tokens = checkpoint(block, tokens, use_reentrant=False)
+            else:
+                tokens = block(tokens)
+        return tokens
+
+    def decode_hidden_loop(
+        self,
+        anchor: Tensor,
+        goal_context: Tensor,
+        samples: int,
+        noise: Tensor | None,
+        goal_mask: Tensor | None = None,
+        steps: int | None = None,
+        compute_hidden_consistency: bool = False,
+    ) -> tuple[Tensor, Tensor, Tensor | None]:
+        """Keep stochastic paths in hidden space and decode the final cloud."""
+        if not self.hidden_loop_steps:
+            raise RuntimeError("the encoder-anchored hidden loop is disabled")
+        if samples < 1:
+            raise ValueError("samples must be positive")
+        steps = self.hidden_loop_steps if steps is None else steps
+        if not 1 <= steps <= self.hidden_loop_steps:
+            raise ValueError("hidden steps must lie in [1, fullres_hidden_loop_steps]")
+        if noise is not None and (
+            noise.ndim != 5 or noise.shape[:2] != (anchor.shape[0], samples)
+            or noise.shape[-2:] != anchor.shape[1:3]
+            or noise.shape[2] not in {self.in_channels, self.dim}
+        ):
+            raise ValueError("hidden loop noise must have shape [B,M,C,H,W]")
+        batch, height, width, dim = anchor.shape
+        hidden = anchor[:, None].expand(-1, samples, -1, -1, -1)
+        hidden = hidden.reshape(batch * samples, height, width, dim)
+        expanded_context = torch.repeat_interleave(goal_context, samples, dim=0)
+        expanded_mask = (
+            None
+            if goal_mask is None
+            else torch.repeat_interleave(goal_mask, samples, dim=0)
+        )
+        random_memory = self._random_memories(
+            anchor,
+            samples=samples,
+            noise=noise,
+        )
+        consistency_steps: list[Tensor] = []
+        final_energy: Tensor | None = None
+        decoded: Tensor | None = None
+        for step in range(steps):
+            if step == 0:
+                proposed = self.condition_hidden(anchor, goal_context, goal_mask)
+                energy = self.spatial_energy(proposed)
+                proposed = proposed[:, None].expand(-1, samples, -1, -1, -1)
+                proposed = proposed.reshape(batch * samples, height, width, dim)
+                energy = energy[:, None].expand(-1, samples, -1, -1)
+                energy = energy.reshape(batch * samples, height, width)
+            else:
+                proposed = self.condition_hidden(
+                    hidden, expanded_context, expanded_mask
+                )
+                energy = self.spatial_energy(proposed)
+            proposed = self._refine_tokens(
+                proposed,
+                random_memory,
+                depth=self.hidden_intermediate_depth,
+                hidden_loop=True,
+                spatial_amplitude=(energy / self.dim).sqrt(),
+            )
+            if self.gradient_checkpointing and self.training:
+                hidden, _, _ = checkpoint(
+                    self.state_update,
+                    hidden,
+                    proposed,
+                    use_reentrant=False,
+                )
+            else:
+                hidden, _, _ = self.state_update(hidden, proposed)
+            decoded = self.absolute_output_head(hidden)
+            if compute_hidden_consistency:
+                with torch.no_grad():
+                    reencoded = self.encode_image_anchor(decoded.detach())
+                consistency_steps.append(
+                    (hidden.float() - reencoded.float())
+                    .square()
+                    .mean(dim=(1, 2, 3))
+                    .reshape(batch, samples)
+                )
+            final_energy = energy.reshape(batch, samples, height, width).mean(1)
+
+        if decoded is None or final_energy is None:
+            raise RuntimeError("hidden loop produced no output")
+        consistency = (
+            torch.stack(consistency_steps, dim=1)
+            if consistency_steps
+            else None
+        )
+        cloud = decoded.reshape(batch, samples, self.in_channels, height, width)
+        return cloud, final_energy, consistency
+
     def decode(
         self,
         condition: Tensor,
@@ -1306,32 +1649,10 @@ class FullResolutionAxialCore(nn.Module):
             )
             random_memories = ()
 
-        random_index = 0
-        for index in range(len(self.blocks) + 1):
-            while (
-                self.random_attention_enabled
-                and random_index < len(self.random_positions)
-                and self.random_positions[random_index] == index
-            ):
-                random_layer = self.random_attentions[random_index]
-                random_memory = random_memories[random_index]
-                if self.gradient_checkpointing and self.training:
-                    tokens = checkpoint(
-                        random_layer,
-                        tokens,
-                        random_memory,
-                        use_reentrant=False,
-                    )
-                else:
-                    tokens = random_layer(tokens, random_memory)
-                random_index += 1
-            if index == len(self.blocks):
-                break
-            block = self.blocks[index]
-            if self.gradient_checkpointing and self.training:
-                tokens = checkpoint(block, tokens, use_reentrant=False)
-            else:
-                tokens = block(tokens)
+        tokens = self._refine_tokens(
+            tokens,
+            random_memories[0] if random_memories else None,
+        )
         residual = self.max_residual * torch.tanh(
             self.output_head(self.output_norm(tokens))
         )
@@ -1387,6 +1708,10 @@ class StochasticImageBridge(nn.Module):
         fullres_random_gate1_init: float = 0.02,
         fullres_random_gate2_init: float | None = None,
         fullres_random_positions: list[int] | tuple[int, ...] = (),
+        fullres_hidden_loop_steps: int = 0,
+        fullres_hidden_anchor_gate_init: float = 0.02,
+        fullres_absolute_decoder_dim: int = 64,
+        fullres_hidden_intermediate_depth: int = -1,
         fullres_goal_condition: str = "image",
         text_vocab_size: int = 16384,
         text_max_length: int = 48,
@@ -1415,6 +1740,8 @@ class StochasticImageBridge(nn.Module):
             raise ValueError("base_channels * 8 must be divisible by heads")
         if normalized_architecture == "pyramid" and bottleneck_channels % 4:
             raise ValueError("base_channels * 8 must be divisible by 4")
+        if fullres_hidden_loop_steps and normalized_architecture != "fullres_axial":
+            raise ValueError("the hidden loop requires architecture=fullres_axial")
         normalized_energy_parameterization = (
             noise_energy_parameterization.strip().lower()
         )
@@ -1489,6 +1816,10 @@ class StochasticImageBridge(nn.Module):
                 random_temperature=fullres_random_temperature,
                 random_gate1_init=fullres_random_gate1_init,
                 random_positions=fullres_random_positions,
+                hidden_loop_steps=fullres_hidden_loop_steps,
+                hidden_anchor_gate_init=fullres_hidden_anchor_gate_init,
+                absolute_decoder_dim=fullres_absolute_decoder_dim,
+                hidden_intermediate_depth=fullres_hidden_intermediate_depth,
                 goal_condition=fullres_goal_condition,
                 text_vocab_size=text_vocab_size,
                 text_max_length=text_max_length,
@@ -1713,7 +2044,44 @@ class StochasticImageBridge(nn.Module):
         return_noise_variance: bool = False,
         return_noise_energy: bool = False,
         goal_mask: Tensor | None = None,
-    ) -> Tensor | tuple[Tensor, Tensor] | tuple[Tensor, Tensor, Tensor]:
+        hidden_steps: int | None = None,
+        return_hidden_consistency: bool = False,
+    ) -> Tensor | tuple[Tensor, ...]:
+        if self.architecture == "fullres_axial" and self.fullres.hidden_loop_steps:
+            self._validate_condition(current, goal, goal_mask)
+            anchor, goal_context = self.fullres.encode_anchor_context(
+                current, goal, goal_mask
+            )
+            cloud, spatial_energy, hidden_consistency = self.fullres.decode_hidden_loop(
+                anchor,
+                goal_context,
+                samples,
+                noise,
+                goal_mask,
+                steps=hidden_steps,
+                compute_hidden_consistency=return_hidden_consistency,
+            )
+            noise_variance = spatial_energy.mean(dim=(-2, -1))
+            if return_noise_energy:
+                if return_hidden_consistency:
+                    assert hidden_consistency is not None
+                    return cloud, noise_variance, spatial_energy, hidden_consistency
+                return cloud, noise_variance, spatial_energy
+            if return_noise_variance:
+                if return_hidden_consistency:
+                    assert hidden_consistency is not None
+                    return cloud, noise_variance, hidden_consistency
+                return cloud, noise_variance
+            if return_hidden_consistency:
+                assert hidden_consistency is not None
+                return cloud, hidden_consistency
+            return cloud
+        if hidden_steps is not None:
+            raise ValueError("hidden_steps requires fullres_hidden_loop_steps > 0")
+        if return_hidden_consistency:
+            raise ValueError(
+                "hidden consistency requires fullres_hidden_loop_steps > 0"
+            )
         fused, current_skips = self.encode_condition(current, goal, goal_mask)
         if samples < 1:
             raise ValueError("samples must be positive")

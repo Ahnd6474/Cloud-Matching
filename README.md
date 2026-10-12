@@ -439,6 +439,39 @@ fixed. The pyramid path requires height and width divisible by 8. The
 full-resolution CvT path accepts arbitrary positive spatial sizes because its
 query grid is never patchified or downsampled.
 
+An optional MolAI-style hidden refinement loop is available for the
+full-resolution path by setting `fullres_hidden_loop_steps` above zero. This
+mode encodes the current image once and keeps every stochastic path in encoder
+space. At step `l`, the evolving hidden state queries the backbone proposal:
+
+```math
+p_l=B(h_l,g),\qquad
+\tilde p_l=p_l+\sigma(G_r(p_l))\odot RAttn(p_l,z)\sqrt{w_l/D},
+```
+
+```math
+h_{l+1}=h_l+\sigma(G_c(c_l)+b_c)\odot RMSNorm(W_c c_l),
+\qquad c_l=CrossAttn(Q=h_l,KV=\tilde p_l).
+```
+
+The next backbone call receives `h_{l+1}`, so the query evolves rather than
+remaining a fixed copy of the initial encoder state. A direct absolute image
+head decodes the final crossed hidden as `tanh(D(h_L))`; it does not add a
+pixel-space residual to `current`.
+
+`loss.hidden_consistency_weight` optionally applies the MolAI manifold
+consistency term at every unrolled step and cloud member:
+
+```math
+L_{hc}=\operatorname{mean}_{l,m}\|h_{l,m}-stopgrad(E(D(h_{l,m})))\|_2^2.
+```
+
+The decoded/re-encoded branch is a detached reference, so this term updates
+the recurrent hidden path but cannot train the decoder to make an easier
+target. There is deliberately no separate `D(E(x))` reconstruction loss; the
+absolute decoder is learned from the ordinary cloud objective. A runnable
+CPU-scale example is `configs/local_hidden_loop_smoke.yaml`.
+
 ## Distribution losses
 
 Change `loss.name` in `configs/train.yaml`:

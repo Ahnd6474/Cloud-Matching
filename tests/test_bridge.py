@@ -898,3 +898,101 @@ def test_text_goal_rejects_image_tensor() -> None:
     current = torch.randn(1, 3, 8, 8)
     with pytest.raises(ValueError, match="text goal"):
         model(current, torch.randn_like(current), samples=1)
+
+
+def _tiny_hidden_loop_model(*, steps: int = 2) -> StochasticImageBridge:
+    return StochasticImageBridge(
+        architecture="fullres_axial",
+        in_channels=3,
+        heads=2,
+        noise_energy_parameterization="fixed_unit",
+        fullres_dim=16,
+        fullres_depth=2,
+        fullres_cross_depth=1,
+        fullres_ffn_ratio=1.0,
+        fullres_window_size=4,
+        fullres_gradient_checkpointing=False,
+        fullres_encoder_type="linear",
+        fullres_attention_type="cvt",
+        fullres_pooled_kernel_sizes=[3],
+        fullres_pooled_output_sizes=[2],
+        fullres_random_attention=True,
+        fullres_random_slots=4,
+        fullres_random_dim=8,
+        fullres_hidden_loop_steps=steps,
+        fullres_hidden_anchor_gate_init=0.02,
+        fullres_absolute_decoder_dim=8,
+        fullres_hidden_intermediate_depth=1,
+    )
+
+
+def test_hidden_loop_decodes_absolute_cloud_and_reports_each_consistency_step() -> None:
+    model = _tiny_hidden_loop_model(steps=2)
+    current = torch.randn(2, 3, 8, 8).clamp(-1.0, 1.0)
+    goal = torch.randn_like(current).clamp(-1.0, 1.0)
+    cloud, variance, energy, consistency = model(
+        current,
+        goal,
+        samples=3,
+        return_noise_variance=True,
+        return_noise_energy=True,
+        return_hidden_consistency=True,
+    )
+
+    assert cloud.shape == (2, 3, 3, 8, 8)
+    assert variance.shape == (2,)
+    assert energy.shape == (2, 8, 8)
+    assert consistency.shape == (2, 2, 3)
+    assert consistency.requires_grad
+    assert cloud.min().item() >= -1.0
+    assert cloud.max().item() <= 1.0
+
+
+def test_hidden_loop_uses_evolving_encoder_query() -> None:
+    model = _tiny_hidden_loop_model(steps=2)
+    state_queries: list[torch.Tensor] = []
+
+    def capture_query(_module: torch.nn.Module, inputs: tuple[torch.Tensor, ...]) -> None:
+        state_queries.append(inputs[0].detach().clone())
+
+    handle = model.fullres.state_update.register_forward_pre_hook(capture_query)
+    try:
+        current = torch.randn(1, 3, 8, 8).clamp(-1.0, 1.0)
+        goal = torch.randn_like(current).clamp(-1.0, 1.0)
+        model(current, goal, samples=2)
+    finally:
+        handle.remove()
+
+    assert len(state_queries) == 2
+    assert not torch.equal(state_queries[0], state_queries[1])
+
+
+def test_hidden_consistency_detaches_reencoder_target_but_trains_hidden_loop() -> None:
+    model = _tiny_hidden_loop_model(steps=2)
+    current = torch.randn(1, 3, 8, 8).clamp(-1.0, 1.0)
+    goal = torch.randn_like(current).clamp(-1.0, 1.0)
+    _, consistency = model(
+        current,
+        goal,
+        samples=2,
+        return_hidden_consistency=True,
+    )
+    consistency.mean().backward()
+
+    assert model.fullres.absolute_output_head.direct_projection.weight.grad is None
+    state_gate_grad = model.fullres.state_update.gate_projection.weight.grad
+    random_gate_grad = model.fullres.hidden_random_attention.gate_projection.weight.grad
+    assert state_gate_grad is not None
+    assert state_gate_grad.abs().sum().item() > 0.0
+    assert random_gate_grad is not None
+    assert random_gate_grad.abs().sum().item() > 0.0
+
+
+def test_hidden_random_attention_respects_spatial_amplitude() -> None:
+    model = _tiny_hidden_loop_model(steps=1)
+    layer = model.fullres.hidden_random_attention
+    query = torch.randn(2, 4, 5, 16)
+    memory = torch.randn(2, 4, 8)
+    zero_amplitude = torch.zeros(2, 4, 5)
+    output = layer(query, memory, zero_amplitude)
+    torch.testing.assert_close(output, query)

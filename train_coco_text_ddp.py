@@ -247,7 +247,7 @@ def validate(
     validation_images: int,
 ) -> dict[str, float]:
     model.eval()
-    totals = torch.zeros(9, device=device)
+    totals = torch.zeros(10, device=device)
     generator = torch.Generator(device=device).manual_seed(config.train.seed + 10_000)
     first_logged = False
     for batch_index, raw in enumerate(loader):
@@ -273,6 +273,9 @@ def validate(
                 noise=fixed_noise if (paired or fixed_noise is not None) else None,
                 return_noise_variance=True,
                 return_noise_energy=spatial is not None,
+                return_hidden_consistency=(
+                    config.loss.hidden_consistency_weight > 0.0
+                ),
                 goal_mask=token_mask,
             )
             assert isinstance(output, tuple)
@@ -286,10 +289,16 @@ def validate(
             spatial_loss = cloud_loss.new_zeros(())
             if spatial is not None:
                 spatial_loss = spatial(output[2], bridge.target_cloud, bridge.current)
+            hidden_consistency_loss = cloud_loss.new_zeros(())
+            if config.loss.hidden_consistency_weight > 0.0:
+                consistency_index = 3 if spatial is not None else 2
+                hidden_consistency_loss = output[consistency_index].mean()
             loss = (
                 cloud_loss
                 + config.loss.perceptual_weight * perceptual_loss
                 + config.loss.spatial_ce_weight * spatial_loss
+                + config.loss.hidden_consistency_weight
+                * hidden_consistency_loss
             )
         count = clean.shape[0]
         predicted_mean = predicted.float().mean(1)
@@ -304,6 +313,7 @@ def validate(
                 torch.tensor(float(count), device=device),
                 cloud_loss.float() * count,
                 perceptual_loss.float() * count,
+                hidden_consistency_loss.float() * count,
             ]
         )
         if not first_logged and validation_images > 0:
@@ -358,6 +368,7 @@ def validate(
         "val_noise_variance": totals[5].item() / denominator,
         "val_cloud_loss": totals[7].item() / denominator,
         "val_perceptual_loss": totals[8].item() / denominator,
+        "val_hidden_consistency_mse": totals[9].item() / denominator,
     }
 
 
@@ -537,6 +548,13 @@ def main() -> None:
         if config.loss.spatial_ce_weight > 0.0
         else None
     )
+    if (
+        config.loss.hidden_consistency_weight > 0.0
+        and config.model.fullres_hidden_loop_steps < 1
+    ):
+        raise ValueError(
+            "loss.hidden_consistency_weight requires a full-resolution hidden loop"
+        )
 
     optimizer = torch.optim.AdamW(
         optimizer_groups(
@@ -592,7 +610,7 @@ def main() -> None:
     for epoch in range(start_epoch, config.train.epochs):
         sampler.set_epoch(epoch)
         train_model.train()
-        totals = torch.zeros(8, device=device)
+        totals = torch.zeros(9, device=device)
         progress = tqdm(
             train_loader,
             desc=f"epoch {epoch + 1}/{config.train.epochs}",
@@ -624,6 +642,9 @@ def main() -> None:
                     noise=bridge.target_noise if paired else None,
                     return_noise_variance=True,
                     return_noise_energy=spatial is not None,
+                    return_hidden_consistency=(
+                        config.loss.hidden_consistency_weight > 0.0
+                    ),
                     goal_mask=token_mask,
                 )
                 assert isinstance(output_value, tuple)
@@ -639,10 +660,16 @@ def main() -> None:
                     spatial_loss = spatial(
                         output_value[2], bridge.target_cloud, bridge.current
                     )
+                hidden_consistency_loss = cloud_loss.new_zeros(())
+                if config.loss.hidden_consistency_weight > 0.0:
+                    consistency_index = 3 if spatial is not None else 2
+                    hidden_consistency_loss = output_value[consistency_index].mean()
                 loss = (
                     cloud_loss
                     + config.loss.perceptual_weight * perceptual_loss
                     + config.loss.spatial_ce_weight * spatial_loss
+                    + config.loss.hidden_consistency_weight
+                    * hidden_consistency_loss
                 )
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -662,6 +689,7 @@ def main() -> None:
                     grad_norm.detach().float(),
                     torch.tensor(float(count), device=device),
                     cloud_loss.detach().float() * count,
+                    hidden_consistency_loss.detach().float() * count,
                 ]
             )
             if is_main and (batch_index + 1) % config.train.log_every == 0:
@@ -672,6 +700,12 @@ def main() -> None:
                 writer.add_scalar("batch/gradient_norm", grad_norm.item(), step)
                 writer.add_scalar("batch/generator_lr", optimizer.param_groups[0]["lr"], step)
                 writer.add_scalar("batch/text_lr", optimizer.param_groups[1]["lr"], step)
+                if config.loss.hidden_consistency_weight > 0.0:
+                    writer.add_scalar(
+                        "batch/hidden_consistency_mse",
+                        hidden_consistency_loss.item(),
+                        step,
+                    )
 
         if world_size > 1:
             dist.all_reduce(totals, op=dist.ReduceOp.SUM)
@@ -685,6 +719,7 @@ def main() -> None:
             "train_noise_variance": totals[4].item() / denominator,
             "gradient_norm": totals[5].item() / max(len(train_loader) * world_size, 1),
             "train_cloud_loss": totals[7].item() / denominator,
+            "train_hidden_consistency_mse": totals[8].item() / denominator,
             "generator_lr": optimizer.param_groups[0]["lr"],
             "text_lr": optimizer.param_groups[1]["lr"],
         }

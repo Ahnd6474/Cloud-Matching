@@ -109,6 +109,13 @@ class Trainer:
             raise ValueError(
                 "loss.spatial_ce_weight requires model.architecture=fullres_axial"
             )
+        if (
+            config.loss.hidden_consistency_weight > 0.0
+            and config.model.fullres_hidden_loop_steps < 1
+        ):
+            raise ValueError(
+                "loss.hidden_consistency_weight requires a full-resolution hidden loop"
+            )
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=config.train.learning_rate,
@@ -182,6 +189,9 @@ class Trainer:
                     noise=model_noise,
                     return_noise_variance=True,
                     return_noise_energy=self.spatial_criterion is not None,
+                    return_hidden_consistency=(
+                        self.config.loss.hidden_consistency_weight > 0.0
+                    ),
                 )
                 if not isinstance(model_output, tuple):
                     raise RuntimeError("model did not return its noise variance")
@@ -195,16 +205,31 @@ class Trainer:
                         predicted, bridge.target_cloud
                     )
                 spatial_loss = cloud_loss.new_zeros(())
+                hidden_consistency_loss = cloud_loss.new_zeros(())
                 if self.spatial_criterion is not None:
-                    if len(model_output) != 3:
+                    minimum_outputs = (
+                        4
+                        if self.config.loss.hidden_consistency_weight > 0.0
+                        else 3
+                    )
+                    if len(model_output) != minimum_outputs:
                         raise RuntimeError("model did not return spatial noise energy")
                     spatial_loss = self.spatial_criterion(
                         model_output[2], bridge.target_cloud, bridge.current
                     )
+                if self.config.loss.hidden_consistency_weight > 0.0:
+                    consistency_index = 3 if self.spatial_criterion is not None else 2
+                    if len(model_output) != consistency_index + 1:
+                        raise RuntimeError(
+                            "model did not return hidden consistency diagnostics"
+                        )
+                    hidden_consistency_loss = model_output[consistency_index].mean()
                 loss = (
                     cloud_loss
                     + self.config.loss.perceptual_weight * perceptual_loss
                     + self.config.loss.spatial_ce_weight * spatial_loss
+                    + self.config.loss.hidden_consistency_weight
+                    * hidden_consistency_loss
                 )
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
@@ -237,6 +262,12 @@ class Trainer:
                 if self.spatial_criterion is not None:
                     self.writer.add_scalar(
                         "train/spatial_ce", spatial_loss.detach().item(), self.global_step
+                    )
+                if self.config.loss.hidden_consistency_weight > 0.0:
+                    self.writer.add_scalar(
+                        "train/hidden_consistency_mse",
+                        hidden_consistency_loss.detach().item(),
+                        self.global_step,
                     )
                 self.writer.add_scalar(
                     "train/gradient_norm", float(grad_norm), self.global_step
